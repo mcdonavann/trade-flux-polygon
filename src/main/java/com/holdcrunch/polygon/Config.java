@@ -25,6 +25,8 @@ public final class Config {
     /** Only ingest trades with timestamp >= this (Unix seconds). 0 = no lower bound. Use POLYGON_SUBGRAPH_START_DATE=2026-03-01 for 1 Mar 2026. */
     public final long polygonSubgraphMinTimestamp;
     public final long polymarketMarketsIntervalMs;
+    /** Max markets per sync run to re-fetch by slug to refresh is_resolved/resolved_at (0 = disabled). */
+    public final int polymarketMarketsResolutionRefreshLimit;
 
     public Config() {
         Properties p = new Properties();
@@ -43,6 +45,7 @@ public final class Config {
         polygonIngestionChunkBlocks = parseInt(orEnv(p.getProperty("polygon.ingestion.chunkBlocks"), "POLYGON_INGESTION_CHUNK_BLOCKS", "2000"), 2000);
         polymarketGammaApiUrl = orEnv(p.getProperty("polymarket.gamma.api.url"), "POLYMARKET_GAMMA_API_URL", "https://gamma-api.polymarket.com").trim();
         polymarketMarketsIntervalMs = parseLong(orEnv(p.getProperty("polymarket.markets.intervalMs"), "POLYMARKET_MARKETS_INTERVAL_MS", "3600000"), 3600_000L);
+        polymarketMarketsResolutionRefreshLimit = Math.max(0, parseInt(orEnv(p.getProperty("polymarket.markets.resolutionRefreshLimit"), "POLYMARKET_MARKETS_RESOLUTION_REFRESH_LIMIT", "100"), 100));
         polymarketSubgraphUrl = orEnv(p.getProperty("polymarket.subgraph.url"), "POLYMARKET_SUBGRAPH_URL",
                 "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn").trim();
         polymarketWsUrl = orEnv(p.getProperty("polymarket.ws.url"), "POLYMARKET_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market").trim();

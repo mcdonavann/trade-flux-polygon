@@ -59,9 +59,12 @@ public class PolygonIngestionService extends AbstractVerticle {
     private final Config cfg;
     private final WebClient webClient;
     private final PgPool pool;
+    private static final long TRADES_LOG_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+
     private final AtomicBoolean backfillInFlight = new AtomicBoolean(false);
     private final AtomicLong lastInserted = new AtomicLong(0);
     private Long backfillTimerId;
+    private Long tradesLogTimerId;
     private io.vertx.core.http.WebSocket ws;
     private Long pingTimerId;
 
@@ -81,17 +84,25 @@ public class PolygonIngestionService extends AbstractVerticle {
                 if (ar.failed()) log.warn("Initial backfill failed: {}", ar.cause().getMessage());
                 if (cfg.polygonWsLiveEnabled) connectWebSocket();
                 backfillTimerId = vertx.setPeriodic(cfg.polygonSubgraphBackfillIntervalMs, id -> runBackfill("periodic"));
+                tradesLogTimerId = vertx.setPeriodic(TRADES_LOG_INTERVAL_MS, id -> logTradesInserted());
                 p.complete();
             });
         } else {
             if (cfg.polygonWsLiveEnabled) connectWebSocket();
+            tradesLogTimerId = vertx.setPeriodic(TRADES_LOG_INTERVAL_MS, id -> logTradesInserted());
             p.complete();
         }
+    }
+
+    private void logTradesInserted() {
+        long n = lastInserted.get();
+        if (n > 0) log.info("Trades inserted (total so far): {}", n);
     }
 
     @Override
     public void stop(Promise<Void> p) {
         if (backfillTimerId != null) vertx.cancelTimer(backfillTimerId);
+        if (tradesLogTimerId != null) vertx.cancelTimer(tradesLogTimerId);
         if (pingTimerId != null) vertx.cancelTimer(pingTimerId);
         if (ws != null) try { ws.close(); } catch (Exception ignored) { }
         p.complete();
@@ -113,10 +124,18 @@ public class PolygonIngestionService extends AbstractVerticle {
                     return fetchOrderFilledEventsPage(timestampGt)
                             .compose(page -> {
                                 if (page == null || page.isEmpty()) return Future.succeededFuture();
-                                log.info("Subgraph backfill {}: got {} events after timestamp {}", trigger, page.size(), timestampGt);
+                                if ("initial".equals(trigger)) {
+                                    log.debug("Subgraph backfill initial: got {} events after timestamp {}", page.size(), timestampGt);
+                                } else {
+                                    log.info("Subgraph backfill {}: got {} events after timestamp {}", trigger, page.size(), timestampGt);
+                                }
                                 return insertTradesFromSubgraph(page)
                                         .compose(n -> {
-                                            log.info("Subgraph backfill {}: inserted {} trades", trigger, n);
+                                            if ("initial".equals(trigger)) {
+                                                log.debug("Subgraph backfill initial: inserted {} trades", n);
+                                            } else {
+                                                log.info("Subgraph backfill {}: inserted {} trades", trigger, n);
+                                            }
                                             return upsertChainTokensFromSubgraph(page);
                                         })
                                         .compose(v -> {

@@ -21,8 +21,11 @@ CREATE TABLE IF NOT EXISTS polygon_trades (
 );
 
 CREATE INDEX IF NOT EXISTS idx_polygon_trades_block ON polygon_trades(block_number);
+CREATE INDEX IF NOT EXISTS idx_polygon_trades_block_timestamp ON polygon_trades(block_timestamp DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS idx_polygon_trades_maker_asset ON polygon_trades(maker_asset_id);
 CREATE INDEX IF NOT EXISTS idx_polygon_trades_taker_asset ON polygon_trades(taker_asset_id);
+CREATE INDEX IF NOT EXISTS idx_polygon_trades_created_at ON polygon_trades(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_polygon_trades_transaction_hash ON polygon_trades(transaction_hash);
 
 -- Token IDs observed on chain (from maker_asset_id / taker_asset_id). Use as “markets” seen on Polygon.
 CREATE TABLE IF NOT EXISTS polygon_chain_tokens (
@@ -33,6 +36,7 @@ CREATE TABLE IF NOT EXISTS polygon_chain_tokens (
 );
 
 CREATE INDEX IF NOT EXISTS idx_polygon_chain_tokens_last_block ON polygon_chain_tokens(last_block);
+CREATE INDEX IF NOT EXISTS idx_polygon_chain_tokens_first_block ON polygon_chain_tokens(first_block);
 
 -- condition_id links trade to market (backfilled from polygon_token_condition)
 ALTER TABLE polygon_trades ADD COLUMN IF NOT EXISTS condition_id TEXT;
@@ -52,6 +56,10 @@ CREATE TABLE IF NOT EXISTS polygon_market_details (
   category_group        TEXT,
   updated_at            TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_polygon_market_details_resolved ON polygon_market_details(resolved_on_timestamp) WHERE resolved_on_timestamp IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_polygon_market_details_category ON polygon_market_details(category_group) WHERE category_group IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_polygon_market_details_league ON polygon_market_details(league_name) WHERE league_name IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS polygon_token_condition (
   token_id     TEXT PRIMARY KEY,
@@ -76,6 +84,9 @@ CREATE TABLE IF NOT EXISTS polygon_markets (
 );
 CREATE INDEX IF NOT EXISTS idx_polygon_markets_resolved ON polygon_markets(is_resolved) WHERE is_resolved = true;
 CREATE INDEX IF NOT EXISTS idx_polygon_markets_sports ON polygon_markets(is_sports) WHERE is_sports = true;
+CREATE INDEX IF NOT EXISTS idx_polygon_markets_yes_token ON polygon_markets(yes_token_id) WHERE yes_token_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_polygon_markets_no_token ON polygon_markets(no_token_id) WHERE no_token_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_polygon_markets_resolved_at ON polygon_markets(resolved_at) WHERE resolved_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS polygon_market_tokens (
   token_id     TEXT PRIMARY KEY,
@@ -94,6 +105,10 @@ ALTER TABLE polygon_trades ADD COLUMN IF NOT EXISTS token_id TEXT;
 ALTER TABLE polygon_trades ADD COLUMN IF NOT EXISTS price NUMERIC(40, 18);
 ALTER TABLE polygon_trades ADD COLUMN IF NOT EXISTS shares NUMERIC(40, 18);
 ALTER TABLE polygon_trades ADD COLUMN IF NOT EXISTS side TEXT;
+
+-- Optional: speeds up ILIKE '%tag%' on polygon_market_details.tags (e.g. sport volume queries).
+-- Requires: CREATE EXTENSION IF NOT EXISTS pg_trgm; (RDS allows it in public or custom schema)
+-- CREATE INDEX IF NOT EXISTS idx_polygon_market_details_tags_gin ON polygon_market_details USING gin(tags gin_trgm_ops);
 
 COMMENT ON TABLE polygon_trades IS 'OrderFilled events from Polygon Exchange contract (subgraph + WebSocket).';
 COMMENT ON TABLE polygon_chain_tokens IS 'Token IDs seen on chain; represents markets with on-chain activity.';

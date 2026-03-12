@@ -15,6 +15,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.List;
@@ -115,10 +116,65 @@ public class PolymarketMarketsService extends AbstractVerticle {
                     return Future.succeededFuture(ids);
                 })
                 .compose(ids -> {
-                    if (ids.isEmpty()) return Future.succeededFuture();
+                    if (ids.isEmpty()) {
+                        log.info("Polymarket markets {}: sync completed (no unsynced tokens)", trigger);
+                        return Future.succeededFuture();
+                    }
                     log.info("Polymarket markets {}: fetching details for {} unsynced token IDs", trigger, ids.size());
-                    return fetchAndUpsertBatchByBatch(ids);
+                    final int tokenCount = ids.size();
+                    return fetchAndUpsertBatchByBatch(ids).compose(marketsSynced -> {
+                        log.info("Polymarket markets {}: sync completed — {} token IDs, {} markets synced", trigger, tokenCount, marketsSynced);
+                        return Future.succeededFuture();
+                    });
+                })
+                .compose(v -> refreshResolutionForUnresolvedMarkets(trigger));
+    }
+
+    /** Re-fetch up to N markets with is_resolved=false by slug from Gamma and upsert to refresh is_resolved/resolved_at. */
+    private Future<Void> refreshResolutionForUnresolvedMarkets(String trigger) {
+        if (cfg.polymarketMarketsResolutionRefreshLimit <= 0) return Future.succeededFuture();
+        return getUnresolvedMarketSlugs(cfg.polymarketMarketsResolutionRefreshLimit)
+                .compose(slugs -> {
+                    if (slugs.isEmpty()) return Future.succeededFuture();
+                    log.info("Polymarket markets {}: refreshing resolution for {} markets (is_resolved=false)", trigger, slugs.size());
+                    return refreshResolutionBySlugs(slugs, 0, 0);
+                })
+                .compose(updated -> {
+                    if (updated > 0) log.info("Polymarket markets {}: resolution refresh updated {} markets", trigger, updated);
+                    return Future.succeededFuture();
                 });
+    }
+
+    private Future<List<String>> getUnresolvedMarketSlugs(int limit) {
+        return pool.preparedQuery("SELECT slug FROM polygon_markets WHERE is_resolved = false AND slug IS NOT NULL AND slug != '' ORDER BY updated_at ASC LIMIT $1")
+                .execute(Tuple.of(limit))
+                .map(rs -> {
+                    List<String> list = new ArrayList<>();
+                    rs.forEach(row -> list.add(row.getString(0)));
+                    return list;
+                })
+                .recover(e -> Future.succeededFuture(List.of()));
+    }
+
+    private Future<Integer> refreshResolutionBySlugs(List<String> slugs, int index, int updatedSoFar) {
+        if (index >= slugs.size()) return Future.succeededFuture(updatedSoFar);
+        String slug = slugs.get(index);
+        String base = cfg.polymarketGammaApiUrl.replaceAll("/$", "");
+        String path = base + "/markets/slug/" + java.net.URLEncoder.encode(slug, java.nio.charset.StandardCharsets.UTF_8).replace("+", "%20");
+        return webClient.getAbs(path).timeout(15_000).send()
+                .compose(r -> {
+                    if (r.statusCode() != 200) return Future.succeededFuture(updatedSoFar);
+                    try {
+                        JsonObject m = r.bodyAsJsonObject();
+                        if (m == null) return Future.succeededFuture(updatedSoFar);
+                        return upsertMarketsAndTokens(new JsonArray().add(m))
+                                .map(n -> updatedSoFar + (n > 0 ? 1 : 0));
+                    } catch (Exception e) {
+                        return Future.succeededFuture(updatedSoFar);
+                    }
+                })
+                .recover(e -> Future.succeededFuture(updatedSoFar))
+                .compose(newUpdated -> refreshResolutionBySlugs(slugs, index + 1, newUpdated));
     }
 
     /** Token IDs from chain that we haven't yet fetched market details for (resume-safe). */
@@ -179,17 +235,17 @@ public class PolymarketMarketsService extends AbstractVerticle {
                 .recover(e -> Future.succeededFuture(ids));
     }
 
-    /** Fetch and upsert batch-by-batch so progress persists on crash (resume-safe). */
-    private Future<Void> fetchAndUpsertBatchByBatch(List<String> tokenIds) {
-        return fetchAndUpsertBatch(tokenIds, 0);
+    /** Fetch and upsert batch-by-batch so progress persists on crash (resume-safe). Returns total markets synced. */
+    private Future<Integer> fetchAndUpsertBatchByBatch(List<String> tokenIds) {
+        return fetchAndUpsertBatch(tokenIds, 0, 0);
     }
 
-    private Future<Void> fetchAndUpsertBatch(List<String> tokenIds, int offset) {
-        if (offset >= tokenIds.size()) return Future.succeededFuture();
+    private Future<Integer> fetchAndUpsertBatch(List<String> tokenIds, int offset, int marketsSoFar) {
+        if (offset >= tokenIds.size()) return Future.succeededFuture(marketsSoFar);
         List<String> batch = tokenIds.subList(offset, Math.min(offset + TOKEN_BATCH, tokenIds.size()));
         return fetchMarketsByTokenIds(batch)
                 .compose(this::upsertMarketsAndTokens)
-                .compose(v -> fetchAndUpsertBatch(tokenIds, offset + batch.size()));
+                .compose(batchMarkets -> fetchAndUpsertBatch(tokenIds, offset + batch.size(), marketsSoFar + batchMarkets));
     }
 
     private Future<JsonArray> fetchMarketsByTokenIds(List<String> tokenIds) {
@@ -231,8 +287,9 @@ public class PolymarketMarketsService extends AbstractVerticle {
         }
     }
 
-    private Future<Void> upsertMarketsAndTokens(JsonArray markets) {
-        if (markets.isEmpty()) return Future.succeededFuture();
+    /** Upsert markets and related rows; returns number of markets in this batch. */
+    private Future<Integer> upsertMarketsAndTokens(JsonArray markets) {
+        if (markets.isEmpty()) return Future.succeededFuture(0);
         List<Tuple> detailsRows = new ArrayList<>();
         List<Tuple> tokenConditionRows = new ArrayList<>();
         List<Tuple> polygonMarketsRows = new ArrayList<>();
@@ -246,9 +303,15 @@ public class PolymarketMarketsService extends AbstractVerticle {
             String tagsStr = tagsToCommaSeparated(asJsonArray(m.getValue("tags")));
             OffsetDateTime resolvedOn = parseResolved(m);
             String closedTime = m.getString("closedTime");
+            boolean closed = Boolean.TRUE.equals(m.getBoolean("closed"));
+            boolean hasResolvedBy = firstNonBlank(m.getString("resolvedBy")) != null;
+            boolean isResolved = closed || resolvedOn != null || hasResolvedBy;
+            // Only set resolved_at from actual resolution time (closedTime/resolvedAt). Do not use updatedAt - it changes on any API update.
+            OffsetDateTime resolvedAt = resolvedOn;
             boolean isSports = tagsStr != null && tagsStr.toLowerCase().contains("sports");
             String sportName = isSports ? "sports" : null;
-            String categoryGroup = m.getString("categoryGroup");
+            String categoryGroup = firstNonBlank(m.getString("categoryGroup"), m.getString("category"));
+            String leagueName = leagueFromMarket(m, isSports);
             String yesTokenId = null, noTokenId = null;
             JsonArray outcomes = asJsonArray(m.getValue("outcomes"));
             JsonArray tokens = asJsonArray(m.getValue("clobTokenIds"));
@@ -263,14 +326,15 @@ public class PolymarketMarketsService extends AbstractVerticle {
                     }
                 }
             }
-            detailsRows.add(Tuple.of(conditionId, slug, question, tagsStr, resolvedOn, closedTime, isSports, sportName, null, categoryGroup));
-            polygonMarketsRows.add(Tuple.of(conditionId, slug, question, yesTokenId, noTokenId, resolvedOn != null, resolvedOn, isSports, sportName, categoryGroup, tagsStr));
+            detailsRows.add(Tuple.of(conditionId, slug, question, tagsStr, resolvedOn, closedTime, isSports, sportName, leagueName, categoryGroup));
+            polygonMarketsRows.add(Tuple.of(conditionId, slug, question, yesTokenId, noTokenId, isResolved, resolvedAt, isSports, sportName, categoryGroup, tagsStr));
         }
+        final int count = detailsRows.size();
         return pool.preparedQuery(UPSERT_MARKET).executeBatch(detailsRows)
                 .compose(v -> pool.preparedQuery(UPSERT_TOKEN_CONDITION).executeBatch(tokenConditionRows))
                 .compose(v -> pool.preparedQuery(UPSERT_POLYGON_MARKET).executeBatch(polygonMarketsRows))
                 .compose(v -> pool.preparedQuery(UPSERT_MARKET_TOKEN).executeBatch(marketTokensRows))
-                .mapEmpty();
+                .map(v -> count);
     }
 
     private static String tagsToCommaSeparated(JsonArray tags) {
@@ -285,7 +349,33 @@ public class PolymarketMarketsService extends AbstractVerticle {
         return sb.length() == 0 ? null : sb.toString();
     }
 
-    /** Gamma API uses closedTime (e.g. "2020-11-02 16:31:01+00"); resolvedAt is rarely present. */
+    private static String firstNonBlank(String... values) {
+        for (String v : values) if (v != null && !v.isBlank()) return v;
+        return null;
+    }
+
+    /** Gamma: closedTime often "2020-11-02 16:31:01+00" (space, +00); resolvedAt rare. Normalize for parsing. */
+    private static final DateTimeFormatter CLOSED_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ssXXX");
+
+    /** From nested events[0] (e.g. "World Series Champion 2024") when sports. */
+    private static String leagueFromMarket(JsonObject m, boolean isSports) {
+        if (!isSports) return null;
+        JsonArray events = asJsonArray(m.getValue("events"));
+        if (events == null || events.isEmpty()) return null;
+        Object first = events.getValue(0);
+        if (first instanceof JsonObject ev)
+            return firstNonBlank(ev.getString("title"), ev.getString("slug"), ev.getString("ticker"));
+        return null;
+    }
+
+    /** Parse ISO-8601 timestamp (e.g. updatedAt "2026-03-12T08:53:06.027112Z"). */
+    private static OffsetDateTime parseIsoTimestamp(String s) {
+        if (s == null || s.isBlank()) return null;
+        try { return OffsetDateTime.parse(s.trim()); } catch (DateTimeParseException e) {
+            try { return Instant.parse(s.trim()).atOffset(ZoneOffset.UTC); } catch (Exception e2) { return null; }
+        }
+    }
+
     private static OffsetDateTime parseResolved(JsonObject m) {
         for (String key : new String[] { "resolvedAt", "closedTime" }) {
             Object r = m.getValue(key);
@@ -293,8 +383,17 @@ public class PolymarketMarketsService extends AbstractVerticle {
             if (r instanceof String s) {
                 s = s.trim();
                 if (s.isEmpty()) continue;
-                try { return OffsetDateTime.parse(s); } catch (DateTimeParseException e) {
-                    try { return Instant.parse(s).atOffset(ZoneOffset.UTC); } catch (Exception e2) { /* try next */ }
+                try { return OffsetDateTime.parse(s); } catch (DateTimeParseException e1) {
+                    try { return Instant.parse(s).atOffset(ZoneOffset.UTC); } catch (Exception e2) {
+                        try {
+                            String normalized = s.replace(" ", "T");
+                            if (s.endsWith("+00") && !s.endsWith("+00:00")) normalized = normalized.replace("+00", "+00:00");
+                            else if (s.endsWith("-00")) normalized = normalized.replace("-00", "-00:00");
+                            return OffsetDateTime.parse(normalized);
+                        } catch (Exception e3) {
+                            try { return OffsetDateTime.parse(s, CLOSED_TIME_FORMAT); } catch (Exception e4) { /* next key */ }
+                        }
+                    }
                 }
             }
         }

@@ -33,3 +33,6 @@ replay_pid*
 .env
 .env.local
 *.local
+
+# Deploy
+deploy.zip
