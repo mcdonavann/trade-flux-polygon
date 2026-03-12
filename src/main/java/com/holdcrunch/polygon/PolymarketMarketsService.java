@@ -18,7 +18,9 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -287,54 +289,87 @@ public class PolymarketMarketsService extends AbstractVerticle {
         }
     }
 
+    private static final String LOAD_SPORTS_KEYS = "SELECT category_key FROM polymarket_category_mapping WHERE is_sports = true";
+
     /** Upsert markets and related rows; returns number of markets in this batch. */
     private Future<Integer> upsertMarketsAndTokens(JsonArray markets) {
         if (markets.isEmpty()) return Future.succeededFuture(0);
-        List<Tuple> detailsRows = new ArrayList<>();
-        List<Tuple> tokenConditionRows = new ArrayList<>();
-        List<Tuple> polygonMarketsRows = new ArrayList<>();
-        List<Tuple> marketTokensRows = new ArrayList<>();
-        for (int i = 0; i < markets.size(); i++) {
-            JsonObject m = markets.getJsonObject(i);
-            String conditionId = m.getString("conditionId");
-            if (conditionId == null || conditionId.isBlank()) continue;
-            String slug = m.getString("slug");
-            String question = m.getString("question");
-            String tagsStr = tagsToCommaSeparated(asJsonArray(m.getValue("tags")));
-            OffsetDateTime resolvedOn = parseResolved(m);
-            String closedTime = m.getString("closedTime");
-            boolean closed = Boolean.TRUE.equals(m.getBoolean("closed"));
-            boolean hasResolvedBy = firstNonBlank(m.getString("resolvedBy")) != null;
-            boolean isResolved = closed || resolvedOn != null || hasResolvedBy;
-            // Only set resolved_at from actual resolution time (closedTime/resolvedAt). Do not use updatedAt - it changes on any API update.
-            OffsetDateTime resolvedAt = resolvedOn;
-            boolean isSports = tagsStr != null && tagsStr.toLowerCase().contains("sports");
-            String sportName = isSports ? "sports" : null;
-            String categoryGroup = firstNonBlank(m.getString("categoryGroup"), m.getString("category"));
-            String leagueName = leagueFromMarket(m, isSports);
-            String yesTokenId = null, noTokenId = null;
-            JsonArray outcomes = asJsonArray(m.getValue("outcomes"));
-            JsonArray tokens = asJsonArray(m.getValue("clobTokenIds"));
-            if (outcomes != null && tokens != null && outcomes.size() == tokens.size()) {
-                for (int j = 0; j < outcomes.size(); j++) {
-                    String out = outcomes.getString(j);
-                    String tid = tokens.getString(j);
-                    if ("Yes".equalsIgnoreCase(out)) yesTokenId = tid; else if ("No".equalsIgnoreCase(out)) noTokenId = tid;
-                    if (tid != null) {
-                        tokenConditionRows.add(Tuple.of(tid, conditionId));
-                        marketTokensRows.add(Tuple.of(tid, conditionId, "Yes".equalsIgnoreCase(out) ? "YES" : "NO"));
+        return pool.query(LOAD_SPORTS_KEYS).execute()
+                .map(rs -> {
+                    Set<String> keys = new HashSet<>();
+                    rs.forEach(row -> keys.add(row.getString(0).toLowerCase().trim()));
+                    return keys;
+                })
+                .recover(e -> Future.succeededFuture(Set.<String>of()))
+                .compose(sportsKeys -> {
+                    List<Tuple> detailsRows = new ArrayList<>();
+                    List<Tuple> tokenConditionRows = new ArrayList<>();
+                    List<Tuple> polygonMarketsRows = new ArrayList<>();
+                    List<Tuple> marketTokensRows = new ArrayList<>();
+                    for (int i = 0; i < markets.size(); i++) {
+                        JsonObject m = markets.getJsonObject(i);
+                        String conditionId = m.getString("conditionId");
+                        if (conditionId == null || conditionId.isBlank()) continue;
+                        String slug = m.getString("slug");
+                        String question = m.getString("question");
+                        String tagsStr = tagsToCommaSeparated(asJsonArray(m.getValue("tags")));
+                        OffsetDateTime resolvedOn = parseResolved(m);
+                        String closedTime = m.getString("closedTime");
+                        boolean closed = Boolean.TRUE.equals(m.getBoolean("closed"));
+                        boolean hasResolvedBy = firstNonBlank(m.getString("resolvedBy")) != null;
+                        boolean isResolved = closed || resolvedOn != null || hasResolvedBy;
+                        OffsetDateTime resolvedAt = resolvedOn;
+                        boolean isSports = (tagsStr != null && !tagsStr.isBlank())
+                                ? tagsStr.toLowerCase().contains("sports")
+                                : isSportsFromMapping(m, slug, firstNonBlank(m.getString("categoryGroup"), m.getString("category")), sportsKeys);
+                        String sportName = isSports ? "sports" : null;
+                        String categoryGroup = firstNonBlank(m.getString("categoryGroup"), m.getString("category"));
+                        String leagueName = leagueFromMarket(m, isSports);
+                        String yesTokenId = null, noTokenId = null;
+                        JsonArray outcomes = asJsonArray(m.getValue("outcomes"));
+                        JsonArray tokens = asJsonArray(m.getValue("clobTokenIds"));
+                        if (outcomes != null && tokens != null && outcomes.size() == tokens.size()) {
+                            for (int j = 0; j < outcomes.size(); j++) {
+                                String out = outcomes.getString(j);
+                                String tid = tokens.getString(j);
+                                if ("Yes".equalsIgnoreCase(out)) yesTokenId = tid; else if ("No".equalsIgnoreCase(out)) noTokenId = tid;
+                                if (tid != null) {
+                                    tokenConditionRows.add(Tuple.of(tid, conditionId));
+                                    marketTokensRows.add(Tuple.of(tid, conditionId, "Yes".equalsIgnoreCase(out) ? "YES" : "NO"));
+                                }
+                            }
+                        }
+                        detailsRows.add(Tuple.of(conditionId, slug, question, tagsStr, resolvedOn, closedTime, isSports, sportName, leagueName, categoryGroup));
+                        polygonMarketsRows.add(Tuple.of(conditionId, slug, question, yesTokenId, noTokenId, isResolved, resolvedAt, isSports, sportName, categoryGroup, tagsStr));
                     }
-                }
+                    final int count = detailsRows.size();
+                    return pool.preparedQuery(UPSERT_MARKET).executeBatch(detailsRows)
+                            .compose(v -> pool.preparedQuery(UPSERT_TOKEN_CONDITION).executeBatch(tokenConditionRows))
+                            .compose(v -> pool.preparedQuery(UPSERT_POLYGON_MARKET).executeBatch(polygonMarketsRows))
+                            .compose(v -> pool.preparedQuery(UPSERT_MARKET_TOKEN).executeBatch(marketTokensRows))
+                            .map(v -> count);
+                });
+    }
+
+    /** When market has no tags, treat as sports if category/series/slug prefix is in polymarket_category_mapping (is_sports=true). */
+    private static boolean isSportsFromMapping(JsonObject m, String slug, String categoryGroup, Set<String> sportsKeys) {
+        if (sportsKeys.isEmpty()) return false;
+        String cat = categoryGroup != null ? categoryGroup.trim().toLowerCase() : null;
+        if (cat != null && !cat.isEmpty() && sportsKeys.contains(cat)) return true;
+        if (cat != null && sportsKeys.contains(cat.replace(' ', '-'))) return true;
+        JsonArray events = asJsonArray(m.getValue("events"));
+        if (events != null && !events.isEmpty()) {
+            Object first = events.getValue(0);
+            if (first instanceof JsonObject ev) {
+                String seriesSlug = firstNonBlank(ev.getString("seriesSlug"), ev.getString("slug"));
+                if (seriesSlug != null && sportsKeys.contains(seriesSlug.trim().toLowerCase())) return true;
             }
-            detailsRows.add(Tuple.of(conditionId, slug, question, tagsStr, resolvedOn, closedTime, isSports, sportName, leagueName, categoryGroup));
-            polygonMarketsRows.add(Tuple.of(conditionId, slug, question, yesTokenId, noTokenId, isResolved, resolvedAt, isSports, sportName, categoryGroup, tagsStr));
         }
-        final int count = detailsRows.size();
-        return pool.preparedQuery(UPSERT_MARKET).executeBatch(detailsRows)
-                .compose(v -> pool.preparedQuery(UPSERT_TOKEN_CONDITION).executeBatch(tokenConditionRows))
-                .compose(v -> pool.preparedQuery(UPSERT_POLYGON_MARKET).executeBatch(polygonMarketsRows))
-                .compose(v -> pool.preparedQuery(UPSERT_MARKET_TOKEN).executeBatch(marketTokensRows))
-                .map(v -> count);
+        if (slug != null && slug.contains("-")) {
+            String prefix = slug.split("-")[0].trim().toLowerCase();
+            if (!prefix.isEmpty() && sportsKeys.contains(prefix)) return true;
+        }
+        return false;
     }
 
     private static String tagsToCommaSeparated(JsonArray tags) {

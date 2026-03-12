@@ -196,7 +196,14 @@ public class PolygonIngestionService extends AbstractVerticle {
                 .recover(e -> Future.<Void>succeededFuture());
     }
 
+    private static final int SUBGRAPH_RETRIES = 3;
+    private static final long SUBGRAPH_RETRY_DELAY_MS = 2_000;
+
     private Future<List<JsonObject>> fetchOrderFilledEventsPage(long timestampGt) {
+        return fetchOrderFilledEventsPageOnce(timestampGt, 0);
+    }
+
+    private Future<List<JsonObject>> fetchOrderFilledEventsPageOnce(long timestampGt, int attempt) {
         String query = """
             query OrderFilledEvents($first: Int!, $timestampGt: BigInt) {
               orderFilledEvents(first: $first, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: $timestampGt }) {
@@ -219,7 +226,17 @@ public class PolygonIngestionService extends AbstractVerticle {
                 .compose(r -> {
                     if (r.statusCode() != 200) {
                         log.warn("Subgraph HTTP {}: {}", r.statusCode(), r.bodyAsString());
-                        return Future.failedFuture("Subgraph " + r.statusCode());
+                        int code = r.statusCode();
+                        boolean retryable = code == 502 || code == 503 || code == 504;
+                        if (retryable && attempt + 1 < SUBGRAPH_RETRIES) {
+                            log.info("Subgraph {} retry {}/{} in {}ms", code, attempt + 1, SUBGRAPH_RETRIES, SUBGRAPH_RETRY_DELAY_MS);
+                            return Future.<List<JsonObject>>future(p -> vertx.setTimer(SUBGRAPH_RETRY_DELAY_MS, id ->
+                                    fetchOrderFilledEventsPageOnce(timestampGt, attempt + 1).onComplete(ar -> {
+                                        if (ar.succeeded()) p.complete(ar.result());
+                                        else p.fail(ar.cause());
+                                    })));
+                        }
+                        return Future.failedFuture("Subgraph " + code);
                     }
                     JsonObject j = r.bodyAsJsonObject();
                     if (j.containsKey("errors")) {

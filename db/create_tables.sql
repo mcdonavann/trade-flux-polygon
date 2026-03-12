@@ -95,6 +95,24 @@ CREATE TABLE IF NOT EXISTS polygon_market_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_polygon_market_tokens_condition ON polygon_market_tokens(condition_id);
 
+-- Category/series/slug keys that count as sports (incl. esports). Lookup key is lowercase.
+-- Insert rows for Gamma category_group, events[].seriesSlug, or slug prefix (e.g. 'cs2', 'counter-strike', 'lol').
+CREATE TABLE IF NOT EXISTS polymarket_category_mapping (
+  category_key TEXT PRIMARY KEY,
+  is_sports    BOOLEAN NOT NULL DEFAULT FALSE
+);
+COMMENT ON TABLE polymarket_category_mapping IS 'Maps Gamma category/series/slug prefix to is_sports; used when tags are missing (e.g. esports).';
+
+-- Seed common sports/esports keys (idempotent: use ON CONFLICT DO NOTHING or run once).
+INSERT INTO polymarket_category_mapping (category_key, is_sports) VALUES
+  ('sports', true), ('counter-strike', true), ('cs2', true), ('csgo', true),
+  ('league of legends', true), ('lol', true), ('dota 2', true), ('dota2', true), ('dota', true),
+  ('valorant', true), ('val', true), ('overwatch', true), ('ow', true),
+  ('rainbow six', true), ('r6', true), ('cod', true), ('rocket league', true),
+  ('counter strike', true), ('esl pro league', true), ('madden', true), ('nba 2k', true),
+  ('fighting', true), ('smash', true), ('tekken', true), ('street fighter', true), ('apex', true)
+ON CONFLICT (category_key) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS sync_state (
   job_name             TEXT PRIMARY KEY,
   last_processed_block BIGINT,

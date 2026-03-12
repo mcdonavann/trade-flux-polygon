@@ -60,7 +60,7 @@ if [ "$ENV_STATUS" = "None" ] || [ -z "$ENV_STATUS" ]; then
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_USER,Value=postgres" \
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_PASSWORD,Value=${DB_PASSWORD}" \
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=PORT,Value=5020" \
-      "Namespace=aws:elasticbeanstalk:application:environment,OptionName=POLYGON_SUBGRAPH_START_DATE,Value=2026-03-01" \
+      "Namespace=aws:elasticbeanstalk:application:environment,OptionName=POLYGON_SUBGRAPH_START_DATE,Value=2026-03-12" \
     --region "$REGION"
 else
   echo "Updating existing environment (status: $ENV_STATUS)..."
@@ -74,7 +74,7 @@ else
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_USER,Value=postgres" \
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_PASSWORD,Value=${DB_PASSWORD}" \
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=PORT,Value=5020" \
-      "Namespace=aws:elasticbeanstalk:application:environment,OptionName=POLYGON_SUBGRAPH_START_DATE,Value=2026-03-01" \
+      "Namespace=aws:elasticbeanstalk:application:environment,OptionName=POLYGON_SUBGRAPH_START_DATE,Value=2026-03-12" \
     --region "$REGION"
 fi
 
