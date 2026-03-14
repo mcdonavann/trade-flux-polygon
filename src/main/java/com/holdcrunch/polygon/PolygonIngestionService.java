@@ -1,6 +1,7 @@
 package com.holdcrunch.polygon;
 
 import io.vertx.core.AbstractVerticle;
+import io.vertx.core.CompositeFuture;
 import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.http.HttpClient;
@@ -182,43 +183,43 @@ public class PolygonIngestionService extends AbstractVerticle {
                 long timestampGt = Math.max(cfg.polygonSubgraphMinTimestamp, lastTs != null ? lastTs : 0L);
                 return fetchOrderFilledEventsPage(timestampGt);
             })
-            .compose(page -> {
-                if (page.isEmpty()) {
-                    backfillInFlight.set(false);
-                    return Future.<Void>succeededFuture();
-                }
-                List<Tuple> batch = new ArrayList<>();
-                for (JsonObject e : page) {
-                    Tuple t = subgraphEventToTuple(e);
-                    if (t != null) batch.add(t);
-                }
-                if (batch.isEmpty()) {
-                    backfillInFlight.set(false);
-                    return Future.<Void>succeededFuture();
-                }
-                return pool.preparedQuery(INSERT_TRADE).executeBatch(batch)
-                    .map(rs -> {
-                        int inserted = rs.rowCount();
-                        if (inserted > 0) lastInserted.addAndGet(inserted);
-                        return (Void) null;
-                    })
-                    .compose(v -> {
-                        long maxTs = page.stream()
-                            .mapToLong(r -> parseLong(r.getString("timestamp"), 0L))
-                            .max().orElse(0L);
-                        return pool.preparedQuery(UPSERT_SYNC_STATE).execute(Tuple.of(JOB_NAME, maxTs))
-                            .map(rs -> (Void) null);
-                    })
-                    .compose(v -> {
-                        if (page.size() >= cfg.polygonSubgraphPageSize) {
-                            vertx.setTimer(1, id -> runSubgraphBackfill(trigger));
-                        }
-                        return Future.<Void>succeededFuture();
-                    });
-            })
+            .compose(page -> processPagePipelined(page, trigger))
             .onComplete(ar -> backfillInFlight.set(false))
             .onFailure(err -> log.warn("Subgraph backfill failed: {}", err.getMessage()));
         return f.recover(err -> Future.<Void>succeededFuture());
+    }
+
+    /**
+     * Process pages with pipelining: overlap insert+cursor-save with fetch of next page.
+     * Bulk insert via executeBatch per page.
+     */
+    private Future<Void> processPagePipelined(List<JsonObject> page, String trigger) {
+        if (page.isEmpty()) return Future.succeededFuture();
+        List<Tuple> batch = new ArrayList<>();
+        for (JsonObject e : page) {
+            Tuple t = subgraphEventToTuple(e);
+            if (t != null) batch.add(t);
+        }
+        if (batch.isEmpty()) return Future.succeededFuture();
+        long maxTs = page.stream()
+            .mapToLong(r -> parseLong(r.getString("timestamp"), 0L))
+            .max().orElse(0L);
+        Future<Void> insertAndSave = pool.preparedQuery(INSERT_TRADE).executeBatch(batch)
+            .map(rs -> {
+                int inserted = rs.rowCount();
+                if (inserted > 0) lastInserted.addAndGet(inserted);
+                return (Void) null;
+            })
+            .compose(v -> pool.preparedQuery(UPSERT_SYNC_STATE).execute(Tuple.of(JOB_NAME, maxTs)).map(rs -> (Void) null));
+        Future<List<JsonObject>> fetchNext = fetchOrderFilledEventsPage(maxTs);
+        return CompositeFuture.all(insertAndSave, fetchNext)
+            .compose(cf -> {
+                List<JsonObject> nextPage = (List<JsonObject>) cf.resultAt(1);
+                if (!nextPage.isEmpty()) {
+                    return processPagePipelined(nextPage, trigger);
+                }
+                return Future.succeededFuture();
+            });
     }
 
     private Future<Long> getLastProcessedTimestamp() {

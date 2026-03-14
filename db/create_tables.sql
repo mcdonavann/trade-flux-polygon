@@ -97,20 +97,26 @@ CREATE INDEX IF NOT EXISTS idx_polygon_market_tokens_condition ON polygon_market
 
 -- Category/series/slug keys that count as sports (incl. esports). Lookup key is lowercase.
 -- Insert rows for Gamma category_group, events[].seriesSlug, or slug prefix (e.g. 'cs2', 'counter-strike', 'lol').
-CREATE TABLE IF NOT EXISTS polymarket_category_mapping (
+CREATE TABLE IF NOT EXISTS polygon_category_mapping (
   category_key TEXT PRIMARY KEY,
-  is_sports    BOOLEAN NOT NULL DEFAULT FALSE
+  is_sports    BOOLEAN NOT NULL DEFAULT FALSE,
+  tag_prefix   TEXT
 );
-COMMENT ON TABLE polymarket_category_mapping IS 'Maps Gamma category/series/slug prefix to is_sports; used when tags are missing (e.g. esports).';
+COMMENT ON TABLE polygon_category_mapping IS 'Maps slug prefix to is_sports and tags_json: tag_prefix is full value e.g. sports,esports or sports,nhl.';
 
--- Seed common sports/esports keys (idempotent: use ON CONFLICT DO NOTHING or run once).
-INSERT INTO polymarket_category_mapping (category_key, is_sports) VALUES
-  ('sports', true), ('counter-strike', true), ('cs2', true), ('csgo', true),
-  ('league of legends', true), ('lol', true), ('dota 2', true), ('dota2', true), ('dota', true),
-  ('valorant', true), ('val', true), ('overwatch', true), ('ow', true),
-  ('rainbow six', true), ('r6', true), ('cod', true), ('rocket league', true),
-  ('counter strike', true), ('esl pro league', true), ('madden', true), ('nba 2k', true),
-  ('fighting', true), ('smash', true), ('tekken', true), ('street fighter', true), ('apex', true)
+ALTER TABLE polygon_category_mapping ADD COLUMN IF NOT EXISTS tag_prefix TEXT;
+
+-- Seed: tag_prefix = full tags value (sports,esports or sports,nhl or crypto,btc).
+INSERT INTO polygon_category_mapping (category_key, is_sports, tag_prefix) VALUES
+  ('sports', true, 'sports'),
+  ('counter-strike', true, 'sports,esports'), ('cs2', true, 'sports,esports'), ('csgo', true, 'sports,esports'),
+  ('league of legends', true, 'sports,esports'), ('lol', true, 'sports,esports'), ('dota 2', true, 'sports,esports'), ('dota2', true, 'sports,esports'), ('dota', true, 'sports,esports'),
+  ('valorant', true, 'sports,esports'), ('val', true, 'sports,esports'), ('overwatch', true, 'sports,esports'), ('ow', true, 'sports,esports'),
+  ('rainbow six', true, 'sports,esports'), ('r6', true, 'sports,esports'), ('cod', true, 'sports,esports'), ('rocket league', true, 'sports,esports'),
+  ('counter strike', true, 'sports,esports'), ('esl pro league', true, 'sports,esports'), ('madden', true, 'sports,esports'), ('nba 2k', true, 'sports,esports'),
+  ('fighting', true, 'sports,esports'), ('smash', true, 'sports,esports'), ('tekken', true, 'sports,esports'), ('street fighter', true, 'sports,esports'), ('apex', true, 'sports,esports'),
+  ('nhl', true, 'sports,nhl'), ('nfl', true, 'sports,nfl'), ('mlb', true, 'sports,mlb'), ('nba', true, 'sports,nba'),
+  ('btc', false, 'crypto,btc'), ('eth', false, 'crypto,eth'), ('sol', false, 'crypto,sol'), ('xrp', false, 'crypto,xrp')
 ON CONFLICT (category_key) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS sync_state (

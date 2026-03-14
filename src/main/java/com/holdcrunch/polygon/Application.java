@@ -40,6 +40,12 @@ public class Application {
         int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "5020"));
         Router router = Router.router(vertx);
         router.get("/health").handler(ctx -> healthWithRecentTrades(ctx, pool));
+        router.post("/trigger-markets-sync").handler(ctx -> {
+            vertx.eventBus().request(PolymarketMarketsService.ADDRESS_TRIGGER_SYNC, null, ar -> {
+                if (ar.succeeded()) ctx.response().setStatusCode(200).end("ok");
+                else ctx.response().setStatusCode(500).end(ar.cause().getMessage());
+            });
+        });
         HttpServer server = vertx.createHttpServer().requestHandler(router);
 
         server.listen(port)

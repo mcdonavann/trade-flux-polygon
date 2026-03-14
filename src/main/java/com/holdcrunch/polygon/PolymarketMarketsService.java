@@ -18,8 +18,10 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -179,11 +181,15 @@ public class PolymarketMarketsService extends AbstractVerticle {
                 .compose(newUpdated -> refreshResolutionBySlugs(slugs, index + 1, newUpdated));
     }
 
-    /** Token IDs from chain that we haven't yet fetched market details for (resume-safe). */
+    /** Token IDs from chain/trades that we haven't yet fetched market details for (resume-safe). */
     private Future<List<String>> getTokenIdsFromDb() {
         return pool.query("""
-            SELECT c.token_id FROM polygon_chain_tokens c
-            LEFT JOIN polygon_token_condition p ON c.token_id = p.token_id
+            SELECT DISTINCT t.token_id FROM (
+                SELECT token_id FROM polygon_chain_tokens
+                UNION
+                SELECT DISTINCT token_id FROM polygon_trades WHERE token_id IS NOT NULL AND token_id != ''
+            ) t
+            LEFT JOIN polygon_token_condition p ON t.token_id = p.token_id
             WHERE p.token_id IS NULL
             """).execute()
                 .map(rs -> {
@@ -237,17 +243,34 @@ public class PolymarketMarketsService extends AbstractVerticle {
                 .recover(e -> Future.succeededFuture(ids));
     }
 
-    /** Fetch and upsert batch-by-batch so progress persists on crash (resume-safe). Returns total markets synced. */
+    /** Fetch and upsert batch-by-batch so progress persists on crash (resume-safe). Returns total markets synced. Iterative to avoid deep Future chains and OOM. */
     private Future<Integer> fetchAndUpsertBatchByBatch(List<String> tokenIds) {
-        return fetchAndUpsertBatch(tokenIds, 0, 0);
+        Promise<Integer> promise = Promise.promise();
+        fetchAndUpsertBatchIterative(tokenIds, 0, 0, promise);
+        return promise.future();
     }
 
-    private Future<Integer> fetchAndUpsertBatch(List<String> tokenIds, int offset, int marketsSoFar) {
-        if (offset >= tokenIds.size()) return Future.succeededFuture(marketsSoFar);
+    private void fetchAndUpsertBatchIterative(List<String> tokenIds, int offset, int marketsSoFar, Promise<Integer> promise) {
+        if (offset >= tokenIds.size()) {
+            promise.complete(marketsSoFar);
+            return;
+        }
         List<String> batch = tokenIds.subList(offset, Math.min(offset + TOKEN_BATCH, tokenIds.size()));
-        return fetchMarketsByTokenIds(batch)
+        fetchMarketsByTokenIds(batch)
                 .compose(this::upsertMarketsAndTokens)
-                .compose(batchMarkets -> fetchAndUpsertBatch(tokenIds, offset + batch.size(), marketsSoFar + batchMarkets));
+                .onComplete(ar -> {
+                    if (ar.failed()) {
+                        promise.fail(ar.cause());
+                        return;
+                    }
+                    int nextOffset = offset + batch.size();
+                    int newTotal = marketsSoFar + ar.result();
+                    if (nextOffset >= tokenIds.size()) {
+                        promise.complete(newTotal);
+                    } else {
+                        vertx.setTimer(1, id -> fetchAndUpsertBatchIterative(tokenIds, nextOffset, newTotal, promise));
+                    }
+                });
     }
 
     private Future<JsonArray> fetchMarketsByTokenIds(List<String> tokenIds) {
@@ -289,19 +312,34 @@ public class PolymarketMarketsService extends AbstractVerticle {
         }
     }
 
-    private static final String LOAD_SPORTS_KEYS = "SELECT category_key FROM polymarket_category_mapping WHERE is_sports = true";
+    private static final String LOAD_CATEGORY_MAPPING = "SELECT category_key, is_sports, tag_prefix FROM polygon_category_mapping";
+
+    /** Row from polygon_category_mapping: is_sports and tag_prefix = full tags value (e.g. sports,esports or sports,nhl). */
+    private record CategoryMappingRow(boolean isSports, String tagPrefix) {}
 
     /** Upsert markets and related rows; returns number of markets in this batch. */
     private Future<Integer> upsertMarketsAndTokens(JsonArray markets) {
         if (markets.isEmpty()) return Future.succeededFuture(0);
-        return pool.query(LOAD_SPORTS_KEYS).execute()
+        return pool.query(LOAD_CATEGORY_MAPPING).execute()
                 .map(rs -> {
-                    Set<String> keys = new HashSet<>();
-                    rs.forEach(row -> keys.add(row.getString(0).toLowerCase().trim()));
-                    return keys;
+                    Map<String, CategoryMappingRow> map = new HashMap<>();
+                    Set<String> sportsKeys = new HashSet<>();
+                    rs.forEach(row -> {
+                        String key = row.getString(0).toLowerCase().trim();
+                        boolean isSports = Boolean.TRUE.equals(row.getBoolean(1));
+                        String tagPrefix = row.getString(2);
+                        if (tagPrefix != null) tagPrefix = tagPrefix.trim();
+                        map.put(key, new CategoryMappingRow(isSports, tagPrefix));
+                        if (isSports) sportsKeys.add(key);
+                    });
+                    return new Object[] { map, sportsKeys };
                 })
-                .recover(e -> Future.succeededFuture(Set.<String>of()))
-                .compose(sportsKeys -> {
+                .recover(e -> Future.succeededFuture(new Object[] { Map.<String, CategoryMappingRow>of(), Set.<String>of() }))
+                .compose(pair -> {
+                    @SuppressWarnings("unchecked")
+                    Map<String, CategoryMappingRow> categoryMap = (Map<String, CategoryMappingRow>) ((Object[]) pair)[0];
+                    @SuppressWarnings("unchecked")
+                    Set<String> sportsKeys = (Set<String>) ((Object[]) pair)[1];
                     List<Tuple> detailsRows = new ArrayList<>();
                     List<Tuple> tokenConditionRows = new ArrayList<>();
                     List<Tuple> polygonMarketsRows = new ArrayList<>();
@@ -319,11 +357,14 @@ public class PolymarketMarketsService extends AbstractVerticle {
                         boolean hasResolvedBy = firstNonBlank(m.getString("resolvedBy")) != null;
                         boolean isResolved = closed || resolvedOn != null || hasResolvedBy;
                         OffsetDateTime resolvedAt = resolvedOn;
+                        String categoryGroup = firstNonBlank(m.getString("categoryGroup"), m.getString("category"));
                         boolean isSports = (tagsStr != null && !tagsStr.isBlank())
                                 ? tagsStr.toLowerCase().contains("sports")
-                                : isSportsFromMapping(m, slug, firstNonBlank(m.getString("categoryGroup"), m.getString("category")), sportsKeys);
+                                : isSportsFromMapping(m, slug, categoryGroup, sportsKeys, categoryMap);
                         String sportName = isSports ? "sports" : null;
-                        String categoryGroup = firstNonBlank(m.getString("categoryGroup"), m.getString("category"));
+                        if (tagsStr == null || tagsStr.isBlank()) {
+                            tagsStr = inferredTagsJson(categoryGroup, isSports, slug, categoryMap);
+                        }
                         String leagueName = leagueFromMarket(m, isSports);
                         String yesTokenId = null, noTokenId = null;
                         JsonArray outcomes = asJsonArray(m.getValue("outcomes"));
@@ -351,8 +392,33 @@ public class PolymarketMarketsService extends AbstractVerticle {
                 });
     }
 
-    /** When market has no tags, treat as sports if category/series/slug prefix is in polymarket_category_mapping (is_sports=true). */
-    private static boolean isSportsFromMapping(JsonObject m, String slug, String categoryGroup, Set<String> sportsKeys) {
+    /** When Gamma gives no tags, set tags_json from category_group or from mapping (tag_prefix is full value e.g. sports,esports). */
+    private static String inferredTagsJson(String categoryGroup, boolean isSports, String slug, Map<String, CategoryMappingRow> categoryMap) {
+        if (categoryGroup != null && !categoryGroup.isBlank()) return categoryGroup.trim();
+        if (slug != null && slug.contains("-")) {
+            String prefix = slug.split("-")[0].trim().toLowerCase();
+            if (!prefix.isEmpty() && categoryMap != null) {
+                CategoryMappingRow row = categoryMap.get(prefix);
+                if (row != null && row.tagPrefix != null && !row.tagPrefix.isBlank()) return row.tagPrefix;
+            }
+        }
+        if (!isSports) return null;
+        if (slug != null && slug.contains("-")) {
+            String prefix = slug.split("-")[0].trim().toLowerCase();
+            if (!prefix.isEmpty()) return "sports," + prefix;
+        }
+        return "sports";
+    }
+
+    /** When market has no tags, treat as sports if category/series/slug prefix is in polygon_category_mapping (is_sports=true). */
+    private static boolean isSportsFromMapping(JsonObject m, String slug, String categoryGroup, Set<String> sportsKeys, Map<String, CategoryMappingRow> categoryMap) {
+        if (slug != null && slug.contains("-")) {
+            String prefix = slug.split("-")[0].trim().toLowerCase();
+            if (!prefix.isEmpty() && categoryMap != null) {
+                CategoryMappingRow row = categoryMap.get(prefix);
+                if (row != null) return row.isSports;
+            }
+        }
         if (sportsKeys.isEmpty()) return false;
         String cat = categoryGroup != null ? categoryGroup.trim().toLowerCase() : null;
         if (cat != null && !cat.isEmpty() && sportsKeys.contains(cat)) return true;
