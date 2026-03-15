@@ -59,6 +59,11 @@ if [ "$ENV_STATUS" = "None" ] || [ -z "$ENV_STATUS" ]; then
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_NAME,Value=tradeflux" \
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_USER,Value=postgres" \
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_PASSWORD,Value=${DB_PASSWORD}" \
+      "Namespace=aws:elasticbeanstalk:application:environment,OptionName=RABBIT_HOST,Value=b-840becf0-9b0d-4c56-b23b-0cda16f58c35.mq.eu-west-1.on.aws" \
+      "Namespace=aws:elasticbeanstalk:application:environment,OptionName=RABBIT_PORT,Value=5671" \
+      "Namespace=aws:elasticbeanstalk:application:environment,OptionName=RABBIT_USER,Value=admin" \
+      "Namespace=aws:elasticbeanstalk:application:environment,OptionName=RABBIT_PASSWORD,Value=${RABBIT_PASSWORD:-}" \
+      "Namespace=aws:elasticbeanstalk:application:environment,OptionName=RABBIT_VHOST,Value=/" \
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=PORT,Value=5020" \
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=POLYGON_SUBGRAPH_START_DATE,Value=2026-03-12" \
     --region "$REGION"
@@ -73,6 +78,11 @@ else
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_NAME,Value=tradeflux" \
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_USER,Value=postgres" \
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_PASSWORD,Value=${DB_PASSWORD}" \
+      "Namespace=aws:elasticbeanstalk:application:environment,OptionName=RABBIT_HOST,Value=b-840becf0-9b0d-4c56-b23b-0cda16f58c35.mq.eu-west-1.on.aws" \
+      "Namespace=aws:elasticbeanstalk:application:environment,OptionName=RABBIT_PORT,Value=5671" \
+      "Namespace=aws:elasticbeanstalk:application:environment,OptionName=RABBIT_USER,Value=admin" \
+      "Namespace=aws:elasticbeanstalk:application:environment,OptionName=RABBIT_PASSWORD,Value=${RABBIT_PASSWORD:-}" \
+      "Namespace=aws:elasticbeanstalk:application:environment,OptionName=RABBIT_VHOST,Value=/" \
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=PORT,Value=5020" \
       "Namespace=aws:elasticbeanstalk:application:environment,OptionName=POLYGON_SUBGRAPH_START_DATE,Value=2026-03-12" \
     --region "$REGION"

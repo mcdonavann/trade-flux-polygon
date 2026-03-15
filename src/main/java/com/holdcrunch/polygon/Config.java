@@ -24,9 +24,28 @@ public final class Config {
     public final long polygonSubgraphBackfillIntervalMs;
     /** Only ingest trades with timestamp >= this (Unix seconds). 0 = no lower bound. Use POLYGON_SUBGRAPH_START_DATE=2026-03-01 for 1 Mar 2026. */
     public final long polygonSubgraphMinTimestamp;
+    /** Overlap window in seconds when backfilling subgraph pages (for continuity). */
+    public final long polygonSubgraphOverlapSeconds;
+    /** Keep recently resolved sports markets on WS for this many days. */
+    public final int polygonWsRecentResolvedLookbackDays;
+    /** How often to refresh WS subscriptions (subscribe new markets, unsubscribe resolved). */
+    public final long polygonWsSubscriptionsRefreshIntervalMs;
     public final long polymarketMarketsIntervalMs;
-    /** Max markets per sync run to re-fetch by slug to refresh is_resolved/resolved_at (0 = disabled). */
-    public final int polymarketMarketsResolutionRefreshLimit;
+    /** RabbitMQ for resolution refresh (stuck markets). Empty = disabled. */
+    public final String rabbitHost;
+    public final int rabbitPort;
+    public final String rabbitUser;
+    public final String rabbitPassword;
+    public final String rabbitVhost;
+    public final String rabbitQueueResolutionRefresh;
+    /** Cooldown hours before re-enqueueing same market (persisted in polygon_resolution_check_cooldown). */
+    public final int polygonResolutionCheckCooldownHours;
+    /** Resolution refresh (publish to Rabbit) interval ms. Default 5 min. */
+    public final long polygonResolutionRefreshIntervalMs;
+    /** Max Gamma API calls per second (rate limit for resolution consumer). */
+    public final int polygonResolutionGammaMaxCallsPerSecond;
+    /** Rabbit consumer prefetch for resolution queue. */
+    public final int polygonResolutionConsumerPrefetch;
 
     public Config() {
         Properties p = new Properties();
@@ -45,7 +64,6 @@ public final class Config {
         polygonIngestionChunkBlocks = parseInt(orEnv(p.getProperty("polygon.ingestion.chunkBlocks"), "POLYGON_INGESTION_CHUNK_BLOCKS", "2000"), 2000);
         polymarketGammaApiUrl = orEnv(p.getProperty("polymarket.gamma.api.url"), "POLYMARKET_GAMMA_API_URL", "https://gamma-api.polymarket.com").trim();
         polymarketMarketsIntervalMs = parseLong(orEnv(p.getProperty("polymarket.markets.intervalMs"), "POLYMARKET_MARKETS_INTERVAL_MS", "3600000"), 3600_000L);
-        polymarketMarketsResolutionRefreshLimit = Math.max(0, parseInt(orEnv(p.getProperty("polymarket.markets.resolutionRefreshLimit"), "POLYMARKET_MARKETS_RESOLUTION_REFRESH_LIMIT", "100"), 100));
         polymarketSubgraphUrl = orEnv(p.getProperty("polymarket.subgraph.url"), "POLYMARKET_SUBGRAPH_URL",
                 "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn").trim();
         polymarketWsUrl = orEnv(p.getProperty("polymarket.ws.url"), "POLYMARKET_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market").trim();
@@ -56,6 +74,19 @@ public final class Config {
         polygonSubgraphMinTimestamp = parseSubgraphMinTimestamp(
                 orEnv(p.getProperty("polygon.subgraph.startDate"), "POLYGON_SUBGRAPH_START_DATE", ""),
                 orEnv(p.getProperty("polygon.subgraph.minTimestamp"), "POLYGON_SUBGRAPH_MIN_TIMESTAMP", "0"));
+        polygonSubgraphOverlapSeconds = parseLong(orEnv(p.getProperty("polygon.subgraph.overlapSeconds"), "POLYGON_SUBGRAPH_OVERLAP_SECONDS", "180"), 180L);
+        polygonWsRecentResolvedLookbackDays = parseInt(orEnv(p.getProperty("polygon.ws.recentResolvedLookbackDays"), "POLYGON_WS_RECENT_RESOLVED_LOOKBACK_DAYS", "2"), 2);
+        polygonWsSubscriptionsRefreshIntervalMs = parseLong(orEnv(p.getProperty("polygon.ws.subscriptionsRefreshIntervalMs"), "POLYGON_WS_SUBSCRIPTIONS_REFRESH_INTERVAL_MS", "300000"), 300_000L);
+        rabbitHost = orEnv(p.getProperty("rabbit.host"), "RABBIT_HOST", "").trim();
+        rabbitPort = parseInt(orEnv(p.getProperty("rabbit.port"), "RABBIT_PORT", "5671"), 5671);
+        rabbitUser = orEnv(p.getProperty("rabbit.user"), "RABBIT_USER", "").trim();
+        rabbitPassword = orEnv(p.getProperty("rabbit.password"), "RABBIT_PASSWORD", "").trim();
+        rabbitVhost = orEnv(p.getProperty("rabbit.vhost"), "RABBIT_VHOST", "/").trim();
+        rabbitQueueResolutionRefresh = orEnv(p.getProperty("rabbit.queue.resolution.refresh"), "RABBIT_QUEUE_RESOLUTION_REFRESH", "polymarket.fetch.slug.resolution.update").trim();
+        polygonResolutionCheckCooldownHours = Math.max(0, parseInt(orEnv(p.getProperty("polygon.resolution.check.cooldownHours"), "POLYGON_RESOLUTION_CHECK_COOLDOWN_HOURS", "8"), 8));
+        polygonResolutionRefreshIntervalMs = parseLong(orEnv(p.getProperty("polygon.resolution.refresh.intervalMs"), "POLYGON_RESOLUTION_REFRESH_INTERVAL_MS", "300000"), 300_000L);
+        polygonResolutionGammaMaxCallsPerSecond = Math.max(1, parseInt(orEnv(p.getProperty("polygon.resolution.gamma.maxCallsPerSecond"), "POLYGON_RESOLUTION_GAMMA_MAX_CALLS_PER_SECOND", "50"), 50));
+        polygonResolutionConsumerPrefetch = Math.max(1, parseInt(orEnv(p.getProperty("polygon.resolution.consumer.prefetch"), "POLYGON_RESOLUTION_CONSUMER_PREFETCH", "10"), 10));
     }
 
     private static long parseSubgraphMinTimestamp(String startDate, String minTimestampStr) {

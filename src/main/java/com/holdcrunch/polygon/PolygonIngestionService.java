@@ -5,12 +5,14 @@ import io.vertx.core.CompositeFuture;
 import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.http.HttpClient;
+import io.vertx.core.http.HttpClientOptions;
 import io.vertx.core.http.WebSocket;
 import io.vertx.core.http.WebSocketConnectOptions;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.client.WebClient;
 import io.vertx.pgclient.PgPool;
+import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.Tuple;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,6 +27,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Queue;
 import java.util.Set;
+import java.util.HashSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -33,49 +36,44 @@ public class PolygonIngestionService extends AbstractVerticle {
     private static final Logger log = LoggerFactory.getLogger(PolygonIngestionService.class);
 
     private static final int BATCH = 200;
-    private static final int WS_SUB_BATCH = 250;
 
-    private static final long WS_HEARTBEAT_MS = 10_000;
-    private static final long WS_RECONNECT_DELAY = 5_000;
-    private static final long TRADES_LOG_INTERVAL_MS = 10 * 60 * 1000;
-    private static final long FLUSH_INTERVAL_MS = 250;
+    // Keep this small to avoid large websocket subscribe frames.
+    private static final int WS_SUB_BATCH = 50;
 
+    private static final long WS_SUB_DELAY_MS = 200L;
+    private static final long WS_HEARTBEAT_MS = 10_000L;
+    private static final long WS_RECONNECT_DELAY_MS = 5_000L;
+    private static final long WS_RECONNECT_MAX_DELAY_MS = 120_000L;
+    private static final int WS_MAX_FRAME_SIZE = 1024 * 1024;
+
+    private static final long TRADES_LOG_INTERVAL_MS = 10 * 60 * 1000L;
+    private static final long FLUSH_INTERVAL_MS = 250L;
     private static final int MAX_PENDING_QUEUE = 50_000;
 
-    private final Config cfg;
-    private final WebClient webClient;
-    private final PgPool pool;
-
-    private HttpClient httpClient;
-    private WebSocket ws;
-
-    private Long pingTimerId;
-    private Long tradesLogTimerId;
-    private Long flushTimerId;
-    private Long reconnectTimerId;
-    private Long backfillTimerId;
-
-    private final AtomicLong lastInserted = new AtomicLong(0);
-    private final AtomicLong lastLoggedInserted = new AtomicLong(0);
-    private final AtomicLong droppedTrades = new AtomicLong(0);
-    private final AtomicLong lastLoggedDropped = new AtomicLong(0);
-
-    private final AtomicBoolean flushInFlight = new AtomicBoolean(false);
-    private final AtomicBoolean reconnectScheduled = new AtomicBoolean(false);
-    private final AtomicBoolean stopping = new AtomicBoolean(false);
-    private final AtomicBoolean backfillInFlight = new AtomicBoolean(false);
-
-    private final Queue<Tuple> pendingTrades = new ArrayDeque<>();
+    private static final int SUBGRAPH_RETRIES = 3;
+    private static final long SUBGRAPH_RETRY_DELAY_MS = 2_000L;
 
     private static final String JOB_NAME = "polygon_trades";
-    private static final String GET_LAST_TIMESTAMP = "SELECT last_processed_block FROM sync_state WHERE job_name = $1";
+
+    /**
+     * Note:
+     * sync_state.last_processed_block is being used as a timestamp cursor here.
+     * The column name is historical and kept to avoid forcing a migration.
+     */
+    private static final String GET_LAST_TIMESTAMP = """
+        SELECT last_processed_block
+        FROM sync_state
+        WHERE job_name = $1
+        """;
+
     private static final String UPSERT_SYNC_STATE = """
         INSERT INTO sync_state (job_name, last_processed_block, last_success_at)
         VALUES ($1, $2, CURRENT_TIMESTAMP)
-        ON CONFLICT (job_name) DO UPDATE SET last_processed_block = EXCLUDED.last_processed_block, last_success_at = CURRENT_TIMESTAMP
+        ON CONFLICT (job_name)
+        DO UPDATE SET
+            last_processed_block = EXCLUDED.last_processed_block,
+            last_success_at = CURRENT_TIMESTAMP
         """;
-    private static final int SUBGRAPH_RETRIES = 3;
-    private static final long SUBGRAPH_RETRY_DELAY_MS = 2000;
 
     private static final String INSERT_TRADE = """
         INSERT INTO polygon_trades (
@@ -99,8 +97,62 @@ public class PolygonIngestionService extends AbstractVerticle {
             side
         )
         VALUES ($1,$2,to_timestamp($3)::timestamptz,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-        ON CONFLICT (order_hash) DO NOTHING
+        ON CONFLICT DO NOTHING
         """;
+
+    /**
+     * Sports-only websocket subscriptions (and subgraph backfill token set).
+     *
+     * polygon_markets: yes_token_id, no_token_id, is_sports, is_resolved, resolved_at.
+     * Include only unresolved sports markets. When resolved, tokens drop out and are unsubscribed on next refresh.
+     * resolved_at IS NULL: include (Gamma often omits it; treat as not yet confirmed resolved).
+     */
+    private static final String LOAD_SPORTS_WS_TOKENS = """
+        SELECT yes_token_id AS token_id
+        FROM polygon_markets
+        WHERE yes_token_id IS NOT NULL
+          AND is_sports = TRUE
+          AND (is_resolved = FALSE OR resolved_at IS NULL)
+
+        UNION
+
+        SELECT no_token_id AS token_id
+        FROM polygon_markets
+        WHERE no_token_id IS NOT NULL
+          AND is_sports = TRUE
+          AND (is_resolved = FALSE OR resolved_at IS NULL)
+        """;
+
+    private static final String LOAD_SUBSCRIBED_TOKENS = "SELECT token_id FROM polygon_ws_subscribed_tokens";
+    private static final String INSERT_SUBSCRIBED_TOKEN = "INSERT INTO polygon_ws_subscribed_tokens (token_id) VALUES ($1) ON CONFLICT (token_id) DO NOTHING";
+    private static final String DELETE_ONE_SUBSCRIBED_TOKEN = "DELETE FROM polygon_ws_subscribed_tokens WHERE token_id = $1";
+
+    private final Config cfg;
+    private final WebClient webClient;
+    private final PgPool pool;
+
+    private HttpClient httpClient;
+    private WebSocket ws;
+
+    private Long pingTimerId;
+    private Long tradesLogTimerId;
+    private Long flushTimerId;
+    private Long reconnectTimerId;
+    private Long backfillTimerId;
+    private Long wsRefreshTimerId;
+
+    private final AtomicLong lastInserted = new AtomicLong(0);
+    private final AtomicLong lastLoggedInserted = new AtomicLong(0);
+    private final AtomicLong droppedTrades = new AtomicLong(0);
+    private final AtomicLong lastLoggedDropped = new AtomicLong(0);
+    private final AtomicLong wsReconnectAttempts = new AtomicLong(0);
+
+    private final AtomicBoolean flushInFlight = new AtomicBoolean(false);
+    private final AtomicBoolean reconnectScheduled = new AtomicBoolean(false);
+    private final AtomicBoolean stopping = new AtomicBoolean(false);
+    private final AtomicBoolean backfillInFlight = new AtomicBoolean(false);
+
+    private final Queue<Tuple> pendingTrades = new ArrayDeque<>();
 
     public PolygonIngestionService(Config cfg, WebClient webClient, PgPool pool) {
         this.cfg = cfg;
@@ -112,12 +164,16 @@ public class PolygonIngestionService extends AbstractVerticle {
     public void start(Promise<Void> startPromise) {
         log.info("Polygon ingestion starting");
 
-        httpClient = vertx.createHttpClient();
+        HttpClientOptions opts = new HttpClientOptions()
+            .setMaxWebSocketFrameSize(WS_MAX_FRAME_SIZE)
+            .setMaxWebSocketMessageSize(WS_MAX_FRAME_SIZE)
+            .setKeepAlive(true);
+
+        httpClient = vertx.createHttpClient(opts);
 
         flushTimerId = vertx.setPeriodic(FLUSH_INTERVAL_MS, id -> flushPendingTrades());
         tradesLogTimerId = vertx.setPeriodic(TRADES_LOG_INTERVAL_MS, id -> logTradesInserted());
 
-        // Optional initial backfill hook
         startInitialBackfill();
 
         if (cfg.polygonWsLiveEnabled) {
@@ -138,6 +194,7 @@ public class PolygonIngestionService extends AbstractVerticle {
         cancelTimer(flushTimerId);
         cancelTimer(reconnectTimerId);
         cancelTimer(backfillTimerId);
+        cancelTimer(wsRefreshTimerId);
 
         try {
             if (ws != null && !ws.isClosed()) {
@@ -162,104 +219,176 @@ public class PolygonIngestionService extends AbstractVerticle {
             log.info("Subgraph backfill disabled by config");
             return;
         }
+
         runSubgraphBackfill("initial")
             .onSuccess(v -> {
                 backfillTimerId = vertx.setPeriodic(cfg.polygonSubgraphBackfillIntervalMs, id ->
-                    runSubgraphBackfill("periodic").onFailure(err ->
-                        log.warn("Periodic subgraph backfill failed: {}", err.getMessage())
-                    )
+                    runSubgraphBackfill("periodic")
+                        .onFailure(err -> log.warn("Periodic subgraph backfill failed: {}", err.getMessage()))
                 );
-                log.info("Subgraph backfill started, interval {}ms", cfg.polygonSubgraphBackfillIntervalMs);
+                log.info("Subgraph backfill started, interval={}ms", cfg.polygonSubgraphBackfillIntervalMs);
             })
             .onFailure(err -> log.warn("Initial subgraph backfill failed: {}", err.getMessage()));
     }
 
+    /**
+     * Subgraph backfill: sports-only (same token set as WebSocket).
+     * Complements WS when it drops by re-scanning the overlap window; only sports trades are inserted.
+     */
     private Future<Void> runSubgraphBackfill(String trigger) {
         if (!backfillInFlight.compareAndSet(false, true)) {
             return Future.succeededFuture();
         }
-        Future<Void> f = getLastProcessedTimestamp()
-            .compose(lastTs -> {
-                long timestampGt = Math.max(cfg.polygonSubgraphMinTimestamp, lastTs != null ? lastTs : 0L);
-                return fetchOrderFilledEventsPage(timestampGt);
+
+        return getLastProcessedTimestamp()
+            .compose(lastTs -> loadSportsWsTokenIds().map(ids -> {
+                long cursorTs = lastTs != null ? lastTs : 0L;
+                long overlapSeconds = Math.max(0L, cfg.polygonSubgraphOverlapSeconds);
+                long resumeTs = Math.max(
+                    cfg.polygonSubgraphMinTimestamp,
+                    Math.max(0L, cursorTs - overlapSeconds)
+                );
+                Set<String> sportsTokenIds = new HashSet<>(ids);
+                log.debug("Running subgraph backfill trigger={}, cursorTs={}, resumeTs={}, sportsTokens={}",
+                    trigger, cursorTs, resumeTs, sportsTokenIds.size());
+                return new Object[] { resumeTs, sportsTokenIds };
+            }))
+            .compose(pair -> {
+                Object[] p = (Object[]) pair;
+                long resumeTs = (Long) p[0];
+                @SuppressWarnings("unchecked")
+                Set<String> sportsTokenIds = (Set<String>) p[1];
+                return fetchOrderFilledEventsPage(resumeTs)
+                    .compose(page -> processPagePipelined(page, trigger, sportsTokenIds));
             })
-            .compose(page -> processPagePipelined(page, trigger))
+            .onFailure(err -> log.warn("Subgraph backfill failed: {}", err.getMessage()))
             .onComplete(ar -> backfillInFlight.set(false))
-            .onFailure(err -> log.warn("Subgraph backfill failed: {}", err.getMessage()));
-        return f.recover(err -> Future.<Void>succeededFuture());
+            .recover(err -> Future.succeededFuture());
     }
 
     /**
-     * Process pages with pipelining: overlap insert+cursor-save with fetch of next page.
-     * Bulk insert via executeBatch per page.
+     * Process pages with pipelining:
+     * - insert current page (sports-only when sportsTokenIds is non-null)
+     * - save cursor
+     * - fetch next page in parallel
      */
-    private Future<Void> processPagePipelined(List<JsonObject> page, String trigger) {
-        if (page.isEmpty()) return Future.succeededFuture();
-        List<Tuple> batch = new ArrayList<>();
-        for (JsonObject e : page) {
-            Tuple t = subgraphEventToTuple(e);
-            if (t != null) batch.add(t);
+    private Future<Void> processPagePipelined(List<JsonObject> page, String trigger, Set<String> sportsTokenIds) {
+        if (page.isEmpty()) {
+            return Future.succeededFuture();
         }
-        if (batch.isEmpty()) return Future.succeededFuture();
+
+        List<Tuple> batch = new ArrayList<>(page.size());
+        for (JsonObject e : page) {
+            Tuple t = subgraphEventToTuple(e, sportsTokenIds);
+            if (t != null) {
+                batch.add(t);
+            }
+        }
+
         long maxTs = page.stream()
             .mapToLong(r -> parseLong(r.getString("timestamp"), 0L))
-            .max().orElse(0L);
-        Future<Void> insertAndSave = pool.preparedQuery(INSERT_TRADE).executeBatch(batch)
-            .map(rs -> {
-                int inserted = rs.rowCount();
-                if (inserted > 0) lastInserted.addAndGet(inserted);
-                return (Void) null;
-            })
-            .compose(v -> pool.preparedQuery(UPSERT_SYNC_STATE).execute(Tuple.of(JOB_NAME, maxTs)).map(rs -> (Void) null));
+            .max()
+            .orElse(0L);
+
+        // Advance cursor even when batch is empty (page had no sports trades) so we don't get stuck
+        Future<Void> insertAndSave = batch.isEmpty()
+            ? pool.preparedQuery(UPSERT_SYNC_STATE).execute(Tuple.of(JOB_NAME, maxTs)).map(rs -> (Void) null)
+            : pool.preparedQuery(INSERT_TRADE)
+                .executeBatch(batch)
+                .map(rs -> {
+                    int inserted = rs.rowCount();
+                    if (inserted > 0) {
+                        lastInserted.addAndGet(inserted);
+                    }
+                    return (Void) null;
+                })
+                .compose(v ->
+                    pool.preparedQuery(UPSERT_SYNC_STATE)
+                        .execute(Tuple.of(JOB_NAME, maxTs))
+                        .map(rs -> (Void) null)
+                );
+
         Future<List<JsonObject>> fetchNext = fetchOrderFilledEventsPage(maxTs);
+
         return CompositeFuture.all(insertAndSave, fetchNext)
             .compose(cf -> {
+                @SuppressWarnings("unchecked")
                 List<JsonObject> nextPage = (List<JsonObject>) cf.resultAt(1);
-                if (!nextPage.isEmpty()) {
-                    return processPagePipelined(nextPage, trigger);
+
+                // timestamp_gte + overlap means next page may repeat rows; DB dedupe handles it.
+                // Continue only if we got a full page.
+                if (nextPage.size() >= cfg.polygonSubgraphPageSize) {
+                    return processPagePipelined(nextPage, trigger, sportsTokenIds);
                 }
+
                 return Future.succeededFuture();
             });
     }
 
     private Future<Long> getLastProcessedTimestamp() {
-        return pool.preparedQuery(GET_LAST_TIMESTAMP).execute(Tuple.of(JOB_NAME))
-            .compose(rs -> {
+        return pool.preparedQuery(GET_LAST_TIMESTAMP)
+            .execute(Tuple.of(JOB_NAME))
+            .map(rs -> {
                 if (rs.iterator().hasNext()) {
                     Long v = rs.iterator().next().getLong(0);
-                    return Future.succeededFuture(v != null ? v : 0L);
+                    return v != null ? v : 0L;
                 }
-                return Future.succeededFuture(0L);
+                return 0L;
             });
     }
 
-    private Future<List<JsonObject>> fetchOrderFilledEventsPage(long timestampGt) {
-        return fetchOrderFilledEventsPageOnce(timestampGt, 0);
+    private Future<List<JsonObject>> fetchOrderFilledEventsPage(long timestampGte) {
+        return fetchOrderFilledEventsPageOnce(timestampGte, 0);
     }
 
-    private Future<List<JsonObject>> fetchOrderFilledEventsPageOnce(long timestampGt, int attempt) {
+    private Future<List<JsonObject>> fetchOrderFilledEventsPageOnce(long timestampGte, int attempt) {
         String query = """
-            query { orderFilledEvents(first: %d, where: { timestamp_gt: "%d" }, orderBy: timestamp, orderDirection: asc) {
-                id transactionHash timestamp orderHash maker taker makerAssetId takerAssetId makerAmountFilled takerAmountFilled fee
-            } }
-            """.formatted(cfg.polygonSubgraphPageSize, timestampGt);
+            query {
+              orderFilledEvents(
+                first: %d,
+                where: { timestamp_gte: "%d" },
+                orderBy: timestamp,
+                orderDirection: asc
+              ) {
+                id
+                transactionHash
+                timestamp
+                orderHash
+                maker
+                taker
+                makerAssetId
+                takerAssetId
+                makerAmountFilled
+                takerAmountFilled
+                fee
+              }
+            }
+            """.formatted(cfg.polygonSubgraphPageSize, timestampGte);
+
         JsonObject body = new JsonObject().put("query", query);
+
         return webClient.postAbs(cfg.polymarketSubgraphUrl)
             .sendJson(body)
             .compose(resp -> {
                 int code = resp.statusCode();
+
                 if (code >= 502 && code <= 504 && attempt < SUBGRAPH_RETRIES) {
-                    log.info("Subgraph {} retry {}/{} in {}ms", code, attempt + 1, SUBGRAPH_RETRIES, SUBGRAPH_RETRY_DELAY_MS);
-                    return Future.future(p -> vertx.setTimer(SUBGRAPH_RETRY_DELAY_MS, id ->
-                        fetchOrderFilledEventsPageOnce(timestampGt, attempt + 1).onComplete(ar -> {
-                            if (ar.succeeded()) p.complete(ar.result());
-                            else p.fail(ar.cause());
-                        })
-                    ));
+                    log.info("Subgraph HTTP {} retry {}/{} in {}ms",
+                        code, attempt + 1, SUBGRAPH_RETRIES, SUBGRAPH_RETRY_DELAY_MS);
+
+                    Promise<List<JsonObject>> retryPromise = Promise.promise();
+                    vertx.setTimer(SUBGRAPH_RETRY_DELAY_MS, id ->
+                        fetchOrderFilledEventsPageOnce(timestampGte, attempt + 1)
+                            .onSuccess(retryPromise::complete)
+                            .onFailure(retryPromise::fail)
+                    );
+                    return retryPromise.future();
                 }
+
                 if (code != 200) {
                     return Future.failedFuture("Subgraph HTTP " + code);
                 }
+
                 JsonObject json = resp.bodyAsJsonObject();
                 JsonObject data = json.getJsonObject("data");
                 if (data == null) {
@@ -267,18 +396,24 @@ public class PolygonIngestionService extends AbstractVerticle {
                     String msg = errs != null && !errs.isEmpty() ? errs.encode() : "No data";
                     return Future.failedFuture("Subgraph error: " + msg);
                 }
+
                 JsonArray events = data.getJsonArray("orderFilledEvents");
                 List<JsonObject> list = new ArrayList<>();
+
                 if (events != null) {
                     for (int i = 0; i < events.size(); i++) {
-                        list.add(events.getJsonObject(i));
+                        JsonObject item = events.getJsonObject(i);
+                        if (item != null) {
+                            list.add(item);
+                        }
                     }
                 }
+
                 return Future.succeededFuture(list);
             });
     }
 
-    private Tuple subgraphEventToTuple(JsonObject e) {
+    private Tuple subgraphEventToTuple(JsonObject e, Set<String> sportsTokenIds) {
         String orderHash = e.getString("orderHash");
         String txHash = e.getString("transactionHash");
         String maker = e.getString("maker");
@@ -289,32 +424,58 @@ public class PolygonIngestionService extends AbstractVerticle {
         String takerAmount = e.getString("takerAmountFilled");
         String fee = e.getString("fee");
         String timestamp = e.getString("timestamp");
-        if (orderHash == null || orderHash.isBlank() || txHash == null || timestamp == null) return null;
+
+        if (orderHash == null || orderHash.isBlank() || txHash == null || txHash.isBlank() || timestamp == null || timestamp.isBlank()) {
+            return null;
+        }
+
+        BigDecimal makerAmt = toBigDecimal(makerAmount);
+        BigDecimal takerAmt = toBigDecimal(takerAmount);
+
+        String tokenId = ("0".equals(makerAssetId) || makerAssetId == null || makerAssetId.isBlank())
+            ? takerAssetId
+            : makerAssetId;
+
+        // Sports-only backfill: skip events whose token is not in the sports set
+        if (sportsTokenIds != null && !sportsTokenIds.contains(tokenId)) {
+            return null;
+        }
+
         long ts = parseLong(timestamp, 0L);
         long blockNumber = 0L;
         int logIndex = Math.abs(orderHash.hashCode()) & 0x7FFFFFFF;
         String contractAddress = cfg.polygonContractAddress;
-        BigDecimal makerAmt = toBigDecimal(makerAmount);
-        BigDecimal takerAmt = toBigDecimal(takerAmount);
-        String tokenId = ("0".equals(makerAssetId) || makerAssetId == null || makerAssetId.isBlank())
-            ? takerAssetId : makerAssetId;
-        BigDecimal shares = "0".equals(makerAssetId) ? takerAmt : makerAmt;
-        BigDecimal price = shares.signum() != 0
-            ? ("0".equals(makerAssetId) ? makerAmt.divide(shares, 18, RoundingMode.HALF_UP) : takerAmt.divide(shares, 18, RoundingMode.HALF_UP))
-            : BigDecimal.ZERO;
-        String side = "0".equals(makerAssetId) ? "BUY" : "SELL";
-        return Tuple.of(
-            orderHash, blockNumber, (double) ts, txHash, logIndex, contractAddress,
-            maker != null ? maker : "", taker != null ? taker : "",
-            toBigDecimal(makerAssetId), toBigDecimal(takerAssetId),
-            makerAmt, takerAmt, fee != null ? new BigDecimal(fee) : null,
-            null, tokenId, price, shares, side
-        );
-    }
 
-    private static long parseLong(String s, long def) {
-        if (s == null || s.isBlank()) return def;
-        try { return Long.parseLong(s.trim()); } catch (NumberFormatException e) { return def; }
+        BigDecimal shares = "0".equals(makerAssetId) ? takerAmt : makerAmt;
+
+        BigDecimal price = shares.signum() != 0
+            ? ("0".equals(makerAssetId)
+                ? makerAmt.divide(shares, 18, RoundingMode.HALF_UP)
+                : takerAmt.divide(shares, 18, RoundingMode.HALF_UP))
+            : BigDecimal.ZERO;
+
+        String side = "0".equals(makerAssetId) ? "BUY" : "SELL";
+
+        return Tuple.of(
+            orderHash,
+            blockNumber,
+            (double) ts,
+            txHash,
+            logIndex,
+            contractAddress,
+            maker != null ? maker : "",
+            taker != null ? taker : "",
+            toBigDecimal(makerAssetId),
+            toBigDecimal(takerAssetId),
+            makerAmt,
+            takerAmt,
+            fee != null && !fee.isBlank() ? new BigDecimal(fee) : null,
+            null,
+            tokenId,
+            price,
+            shares,
+            side
+        );
     }
 
     private void logTradesInserted() {
@@ -333,10 +494,10 @@ public class PolygonIngestionService extends AbstractVerticle {
 
         if (deltaInserted == 0 && deltaDropped == 0) {
             log.warn("No new trades in last 10 minutes. totalInserted={}, totalDropped={}, queueSize={}",
-                    currentInserted, currentDropped, queueSize);
+                currentInserted, currentDropped, queueSize);
         } else {
             log.info("Trades inserted +{} (total {}), dropped +{} (total {}), queueSize={}",
-                    deltaInserted, currentInserted, deltaDropped, currentDropped, queueSize);
+                deltaInserted, currentInserted, deltaDropped, currentDropped, queueSize);
         }
     }
 
@@ -345,83 +506,190 @@ public class PolygonIngestionService extends AbstractVerticle {
             return;
         }
 
-        pool.query("""
-            SELECT token_id FROM polygon_market_tokens
-            UNION
-            SELECT yes_token_id FROM polygon_markets WHERE yes_token_id IS NOT NULL
-            UNION
-            SELECT no_token_id FROM polygon_markets WHERE no_token_id IS NOT NULL
-        """)
-        .execute()
-        .onFailure(err -> {
-            log.warn("Failed loading token ids: {}", err.getMessage());
-            scheduleReconnect();
-        })
-        .onSuccess(rows -> {
-            Set<String> deduped = new LinkedHashSet<>();
-
-            rows.forEach(row -> {
-                String id = row.getString(0);
-                if (id != null && !id.isBlank()) {
-                    deduped.add(id);
+        loadSportsWsTokenIds()
+            .onFailure(err -> {
+                log.warn("Failed loading sports websocket token ids: {}", err.getMessage());
+                scheduleReconnect();
+            })
+            .onSuccess(tokenIds -> {
+                if (tokenIds.isEmpty()) {
+                    log.warn("No sports tokens found for websocket subscription");
+                    scheduleReconnect();
+                    return;
                 }
-            });
 
-            List<String> tokenIds = new ArrayList<>(deduped);
+                ParsedWsUrl parsed;
+                try {
+                    parsed = parseWsUrl(cfg.polymarketWsUrl);
+                } catch (Exception e) {
+                    log.warn("Invalid websocket URL '{}': {}", cfg.polymarketWsUrl, e.getMessage());
+                    scheduleReconnect();
+                    return;
+                }
 
-            if (tokenIds.isEmpty()) {
-                log.warn("No tokens found for WS subscription");
-                scheduleReconnect();
-                return;
-            }
-
-            ParsedWsUrl parsed;
-            try {
-                parsed = parseWsUrl(cfg.polymarketWsUrl);
-            } catch (Exception e) {
-                log.warn("Invalid WebSocket URL '{}': {}", cfg.polymarketWsUrl, e.getMessage());
-                scheduleReconnect();
-                return;
-            }
-
-            log.info("Connecting WebSocket host={}, port={}, path={}, tokenCount={}",
+                log.info("Connecting websocket host={}, port={}, path={}, sportsTokenCount={}",
                     parsed.host(), parsed.port(), parsed.path(), tokenIds.size());
 
-            WebSocketConnectOptions opts = new WebSocketConnectOptions()
+                WebSocketConnectOptions opts = new WebSocketConnectOptions()
                     .setHost(parsed.host())
                     .setPort(parsed.port())
                     .setURI(parsed.path())
                     .setSsl(parsed.port() == 443)
                     .putHeader("User-Agent", "trade-flux-polygon/1.0")
                     .putHeader("Origin", "https://polymarket.com");
-            httpClient.webSocket(opts)
-                .onFailure(err -> {
-                    log.warn("WebSocket connect failed: {}", err.getMessage());
-                    scheduleReconnect();
-                })
-                .onSuccess(socket -> {
-                    reconnectScheduled.set(false);
-                    ws = socket;
 
-                    log.info("WebSocket connected");
-
-                    ws.textMessageHandler(this::onWsMessage);
-
-                    ws.closeHandler(v -> {
-                        log.warn("WebSocket closed");
-                        ws = null;
-                        cancelTimer(pingTimerId);
+                httpClient.webSocket(opts)
+                    .onFailure(err -> {
+                        log.warn("WebSocket connect failed: {}", err.getMessage());
                         scheduleReconnect();
+                    })
+                    .onSuccess(socket -> {
+                        reconnectScheduled.set(false);
+                        wsReconnectAttempts.set(0);
+                        ws = socket;
+
+                        log.info("WebSocket connected");
+
+                        ws.textMessageHandler(this::onWsMessage);
+
+                        ws.closeHandler(v -> {
+                            log.warn("WebSocket closed");
+                            ws = null;
+                            cancelTimer(pingTimerId);
+                            cancelTimer(wsRefreshTimerId);
+                            scheduleReconnect();
+                        });
+
+                        ws.exceptionHandler(err ->
+                            log.warn("WebSocket error: {}", err.getMessage())
+                        );
+
+                        subscribeTokens(tokenIds);
+                        persistSubscribedTokens(tokenIds);
+                        startHeartbeat();
+                        startWsRefreshTimer();
                     });
+            });
+    }
 
-                    ws.exceptionHandler(err ->
-                        log.warn("WebSocket error: {}", err.getMessage())
-                    );
+    private Future<List<String>> loadSportsWsTokenIds() {
+        return pool.preparedQuery(LOAD_SPORTS_WS_TOKENS)
+            .execute()
+            .map(rows -> {
+                Set<String> deduped = new LinkedHashSet<>();
+                for (Row row : rows) {
+                    String tokenId = row.getString("token_id");
+                    if (tokenId != null && !tokenId.isBlank()) {
+                        deduped.add(tokenId);
+                    }
+                }
+                return new ArrayList<>(deduped);
+            });
+    }
 
-                    subscribeTokens(tokenIds);
-                    startHeartbeat();
-                });
-        });
+    private Future<Set<String>> loadSubscribedTokenIds() {
+        return pool.preparedQuery(LOAD_SUBSCRIBED_TOKENS)
+            .execute()
+            .map(rows -> {
+                Set<String> set = new HashSet<>();
+                for (Row row : rows) {
+                    String tokenId = row.getString("token_id");
+                    if (tokenId != null && !tokenId.isBlank()) {
+                        set.add(tokenId);
+                    }
+                }
+                return set;
+            });
+    }
+
+    /** Replace persisted subscribed tokens with the set we just subscribed to (e.g. on connect). */
+    private void persistSubscribedTokens(List<String> tokenIds) {
+        if (tokenIds == null || tokenIds.isEmpty()) {
+            return;
+        }
+        pool.preparedQuery("TRUNCATE polygon_ws_subscribed_tokens").execute()
+            .onFailure(err -> log.warn("Failed to truncate polygon_ws_subscribed_tokens: {}", err.getMessage()))
+            .onSuccess(v -> {
+                List<Tuple> batch = tokenIds.stream().map(Tuple::of).toList();
+                pool.preparedQuery(INSERT_SUBSCRIBED_TOKEN).executeBatch(batch)
+                    .onFailure(err -> log.warn("Failed to persist subscribed tokens: {}", err.getMessage()))
+                    .onSuccess(r -> log.debug("Persisted {} subscribed token ids", tokenIds.size()));
+            });
+    }
+
+    private void startWsRefreshTimer() {
+        cancelTimer(wsRefreshTimerId);
+        long intervalMs = Math.max(60_000L, cfg.polygonWsSubscriptionsRefreshIntervalMs);
+        wsRefreshTimerId = vertx.setPeriodic(intervalMs, id -> refreshWsSubscriptions());
+        log.info("WS subscriptions refresh started, interval={}ms", intervalMs);
+    }
+
+    /**
+     * Subscribe to new sports tokens and unsubscribe from tokens no longer in the sports set (e.g. resolved past lookback).
+     * Updates polygon_ws_subscribed_tokens to match.
+     */
+    private void refreshWsSubscriptions() {
+        if (ws == null || ws.isClosed() || stopping.get()) {
+            return;
+        }
+
+        CompositeFuture.join(loadSportsWsTokenIds(), loadSubscribedTokenIds())
+            .onFailure(err -> log.warn("Failed to load tokens for WS refresh: {}", err.getMessage()))
+            .onSuccess(cf -> {
+                @SuppressWarnings("unchecked")
+                List<String> sportsList = (List<String>) cf.resultAt(0);
+                @SuppressWarnings("unchecked")
+                Set<String> subscribed = (Set<String>) cf.resultAt(1);
+                Set<String> sports = new HashSet<>(sportsList);
+
+                Set<String> toUnsubscribe = new HashSet<>(subscribed);
+                toUnsubscribe.removeAll(sports);
+                Set<String> toSubscribe = new HashSet<>(sports);
+                toSubscribe.removeAll(subscribed);
+
+                if (toUnsubscribe.isEmpty() && toSubscribe.isEmpty()) {
+                    return;
+                }
+
+                if (!toUnsubscribe.isEmpty()) {
+                    List<String> unsubList = new ArrayList<>(toUnsubscribe);
+                    sendUnsubscribeBatches(unsubList);
+                    List<Tuple> deleteBatch = unsubList.stream().map(Tuple::of).toList();
+                    pool.preparedQuery(DELETE_ONE_SUBSCRIBED_TOKEN).executeBatch(deleteBatch)
+                        .onFailure(err -> log.warn("Failed to delete unsubscribed tokens: {}", err.getMessage()))
+                        .onSuccess(r -> log.info("Unsubscribed {} tokens (resolved or no longer sports), removed from persisted set", unsubList.size()));
+                }
+
+                if (!toSubscribe.isEmpty()) {
+                    List<String> subList = new ArrayList<>(toSubscribe);
+                    subscribeTokens(subList);
+                    List<Tuple> insertBatch = subList.stream().map(Tuple::of).toList();
+                    pool.preparedQuery(INSERT_SUBSCRIBED_TOKEN).executeBatch(insertBatch)
+                        .onFailure(err -> log.warn("Failed to persist newly subscribed tokens: {}", err.getMessage()))
+                        .onSuccess(r -> log.info("Subscribed {} new sports tokens, persisted", subList.size()));
+                }
+            });
+    }
+
+    private void sendUnsubscribeBatches(List<String> tokenIds) {
+        if (tokenIds == null || tokenIds.isEmpty() || ws == null || ws.isClosed()) {
+            return;
+        }
+        for (int i = 0; i < tokenIds.size(); i += WS_SUB_BATCH) {
+            int start = i;
+            int end = Math.min(i + WS_SUB_BATCH, tokenIds.size());
+            List<String> batch = tokenIds.subList(start, end);
+            long delayMs = (i / WS_SUB_BATCH) * WS_SUB_DELAY_MS;
+            vertx.setTimer(safeDelay(delayMs), id -> {
+                if (ws == null || ws.isClosed()) return;
+                JsonObject msg = new JsonObject()
+                    .put("type", "market")
+                    .put("assets_ids", new JsonArray(batch))
+                    .put("operation", "unsubscribe");
+                ws.writeTextMessage(msg.encode());
+                log.info("Unsubscribed batch {}..{} size={}", start, end, batch.size());
+            });
+        }
     }
 
     private void startHeartbeat() {
@@ -447,38 +715,67 @@ public class PolygonIngestionService extends AbstractVerticle {
             return;
         }
 
-        reconnectTimerId = vertx.setTimer(safeDelay(WS_RECONNECT_DELAY), id -> {
+        long attempt = wsReconnectAttempts.getAndIncrement();
+        long exponentialDelay = WS_RECONNECT_DELAY_MS * (1L << Math.min(attempt, 5));
+        long delay = Math.min(exponentialDelay, WS_RECONNECT_MAX_DELAY_MS);
+
+        if (attempt > 0) {
+            log.info("WebSocket reconnect attempt {}, delay={}ms", attempt + 1, delay);
+        }
+
+        reconnectTimerId = vertx.setTimer(safeDelay(delay), id -> {
             reconnectScheduled.set(false);
             connectWebSocket();
         });
     }
 
     private void subscribeTokens(List<String> tokens) {
+        if (tokens == null || tokens.isEmpty()) {
+            return;
+        }
+
         if (ws == null || ws.isClosed()) {
             log.warn("WebSocket unavailable during subscription");
             return;
         }
 
+        int batchIndex = 0;
         for (int i = 0; i < tokens.size(); i += WS_SUB_BATCH) {
+            int start = i;
             int end = Math.min(i + WS_SUB_BATCH, tokens.size());
+            List<String> batchTokens = new ArrayList<>(tokens.subList(start, end));
+            long delayMs = batchIndex * WS_SUB_DELAY_MS;
+            batchIndex++;
 
-            JsonObject msg = new JsonObject()
-                .put("type", "market")
-                .put("assets_ids", new JsonArray(tokens.subList(i, end)))
-                .put("custom_feature_enabled", true);
+            vertx.setTimer(safeDelay(delayMs), id -> {
+                if (ws == null || ws.isClosed()) {
+                    return;
+                }
 
-            String payload = msg.encode();
-            ws.writeTextMessage(payload);
+                JsonObject msg = new JsonObject()
+                    .put("type", "market")
+                    .put("assets_ids", new JsonArray(batchTokens))
+                    .put("custom_feature_enabled", true);
 
-            log.info("Subscribed batch {}..{} (size={})", i, end, end - i);
-            log.debug("WS subscribe payload: {}", payload);
+                String payload = msg.encode();
+                int payloadBytes = payload.getBytes(StandardCharsets.UTF_8).length;
+
+                ws.writeTextMessage(payload);
+
+                log.debug("Subscribed batch {}..{} size={} payloadBytes={}",
+                    start, end, batchTokens.size(), payloadBytes);
+                log.debug("WS subscribe payload: {}", payload);
+            });
         }
     }
 
     private void onWsMessage(String text) {
-        if (text == null || text.isBlank()
-                || "{}".equals(text.trim())
-                || "PONG".equals(text.trim())) {
+        if (text == null || text.isBlank()) {
+            return;
+        }
+
+        String trimmed = text.trim();
+        if ("{}".equals(trimmed) || "PONG".equals(trimmed)) {
             return;
         }
 
@@ -529,24 +826,24 @@ public class PolygonIngestionService extends AbstractVerticle {
         String orderHash = syntheticOrderHash(txHash, assetId, timestamp);
 
         return Tuple.of(
-            orderHash,                   // order_hash
-            0L,                          // block_number
-            (double) tsSeconds,          // block_timestamp epoch seconds
-            txHash,                      // transaction_hash
-            0,                           // log_index
-            "",                          // contract_address
-            "",                          // maker
-            "",                          // taker
-            toBigDecimal(assetId),       // maker_asset_id
-            toBigDecimal(assetId),       // taker_asset_id
-            BigDecimal.ZERO,             // maker_amount
-            toBigDecimal(size),          // taker_amount
-            null,                        // fee
-            market,                      // condition_id
-            assetId,                     // token_id
-            toBigDecimal(price),         // price
-            toBigDecimal(size),          // shares
-            side                         // side
+            orderHash,
+            0L,
+            (double) tsSeconds,
+            txHash,
+            0,
+            "",
+            "",
+            "",
+            toBigDecimal(assetId),
+            toBigDecimal(assetId),
+            BigDecimal.ZERO,
+            toBigDecimal(size),
+            null,
+            market,
+            assetId,
+            toBigDecimal(price),
+            toBigDecimal(size),
+            side
         );
     }
 
@@ -619,20 +916,14 @@ public class PolygonIngestionService extends AbstractVerticle {
             });
     }
 
-    private static String syntheticOrderHash(String txHash, String assetId, String ts) {
+    private static long parseLong(String s, long def) {
+        if (s == null || s.isBlank()) {
+            return def;
+        }
         try {
-            String base = (txHash == null ? "" : txHash) + "|" + assetId + "|" + ts;
-            MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] h = md.digest(base.getBytes(StandardCharsets.UTF_8));
-
-            StringBuilder sb = new StringBuilder("ws-");
-            for (byte b : h) {
-                sb.append(String.format("%02x", b));
-            }
-
-            return sb.substring(0, Math.min(sb.length(), 66));
-        } catch (Exception e) {
-            return "ws-" + Math.abs(((txHash == null ? "" : txHash) + assetId + ts).hashCode());
+            return Long.parseLong(s.trim());
+        } catch (NumberFormatException e) {
+            return def;
         }
     }
 
@@ -645,6 +936,23 @@ public class PolygonIngestionService extends AbstractVerticle {
             return new BigDecimal(s);
         } catch (Exception e) {
             return BigDecimal.ZERO;
+        }
+    }
+
+    private static String syntheticOrderHash(String txHash, String assetId, String ts) {
+        try {
+            String base = (txHash == null ? "" : txHash) + "|" + assetId + "|" + ts;
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] hash = md.digest(base.getBytes(StandardCharsets.UTF_8));
+
+            StringBuilder sb = new StringBuilder("ws-");
+            for (byte b : hash) {
+                sb.append(String.format("%02x", b));
+            }
+
+            return sb.substring(0, Math.min(sb.length(), 66));
+        } catch (Exception e) {
+            return "ws-" + Math.abs(((txHash == null ? "" : txHash) + assetId + ts).hashCode());
         }
     }
 

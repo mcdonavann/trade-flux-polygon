@@ -9,8 +9,8 @@
 
 WITH date_window AS (
   SELECT
-    '2026-03-01 00:00:00'::timestamptz AS start_window,
-    '2026-03-01 00:25:00'::timestamptz AS end_window
+    :'start_ts'::timestamptz AS start_window,
+    :'end_ts'::timestamptz AS end_window
 ),
 trades_by_market AS (
   SELECT

@@ -80,7 +80,8 @@ CREATE TABLE IF NOT EXISTS polygon_markets (
   is_sports      BOOLEAN DEFAULT FALSE,
   sport_name     TEXT,
   category_group TEXT,
-  tags_json      TEXT
+  tags_json      TEXT,
+  volume         NUMERIC(40, 18)
 );
 CREATE INDEX IF NOT EXISTS idx_polygon_markets_resolved ON polygon_markets(is_resolved) WHERE is_resolved = true;
 CREATE INDEX IF NOT EXISTS idx_polygon_markets_sports ON polygon_markets(is_sports) WHERE is_sports = true;
@@ -124,6 +125,13 @@ CREATE TABLE IF NOT EXISTS sync_state (
   last_processed_block BIGINT,
   last_success_at      TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Persisted WebSocket market subscriptions (sports tokens). Updated on connect and on refresh; removed when we unsubscribe (e.g. market resolved).
+CREATE TABLE IF NOT EXISTS polygon_ws_subscribed_tokens (
+  token_id     TEXT PRIMARY KEY,
+  subscribed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+COMMENT ON TABLE polygon_ws_subscribed_tokens IS 'Token IDs we have subscribed to on Polymarket WS; removed when we unsubscribe (e.g. resolved past lookback).';
 
 ALTER TABLE polygon_trades ADD COLUMN IF NOT EXISTS token_id TEXT;
 ALTER TABLE polygon_trades ADD COLUMN IF NOT EXISTS price NUMERIC(40, 18);

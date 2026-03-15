@@ -36,6 +36,7 @@ public class Application {
         WebClient client = WebClient.create(vertx);
         PolymarketMarketsService markets = new PolymarketMarketsService(cfg, client, pool);
         PolygonIngestionService ingestion = new PolygonIngestionService(cfg, client, pool);
+        ResolutionRefreshConsumer resolutionConsumer = new ResolutionRefreshConsumer(cfg);
 
         int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "5020"));
         Router router = Router.router(vertx);
@@ -51,7 +52,8 @@ public class Application {
         server.listen(port)
                 .compose(v -> vertx.deployVerticle(markets))
                 .compose(mid -> vertx.deployVerticle(ingestion))
-                .onSuccess(ingId -> System.out.println("Trade Flux Polygon running on port " + port + ". Order: markets → subgraph backfill → WebSocket."))
+                .compose(ingId -> vertx.deployVerticle(resolutionConsumer))
+                .onSuccess(id -> System.out.println("Trade Flux Polygon running on port " + port + ". Order: markets → subgraph backfill → WebSocket → resolution consumer."))
                 .onFailure(err -> {
                     System.err.println("Deploy failed: " + err.getMessage());
                     vertx.close();

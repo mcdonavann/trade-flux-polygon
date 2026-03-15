@@ -1,5 +1,8 @@
 package com.holdcrunch.polygon;
 
+import com.rabbitmq.client.Channel;
+import com.rabbitmq.client.Connection;
+import com.rabbitmq.client.ConnectionFactory;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Future;
 import io.vertx.core.Promise;
@@ -12,6 +15,7 @@ import io.vertx.sqlclient.Tuple;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -53,13 +57,14 @@ public class PolymarketMarketsService extends AbstractVerticle {
         ON CONFLICT (token_id) DO UPDATE SET condition_id = EXCLUDED.condition_id
         """;
     private static final String UPSERT_POLYGON_MARKET = """
-        INSERT INTO polygon_markets (condition_id, slug, question, yes_token_id, no_token_id, updated_at, is_resolved, resolved_at, is_sports, sport_name, category_group, tags_json)
-        VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, $6, $7, $8, $9, $10, $11)
+        INSERT INTO polygon_markets (condition_id, slug, question, yes_token_id, no_token_id, updated_at, is_resolved, resolved_at, is_sports, sport_name, category_group, tags_json, volume)
+        VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (condition_id) DO UPDATE SET
           slug = EXCLUDED.slug, question = EXCLUDED.question, yes_token_id = COALESCE(EXCLUDED.yes_token_id, polygon_markets.yes_token_id),
           no_token_id = COALESCE(EXCLUDED.no_token_id, polygon_markets.no_token_id), updated_at = CURRENT_TIMESTAMP,
           is_resolved = EXCLUDED.is_resolved, resolved_at = COALESCE(EXCLUDED.resolved_at, polygon_markets.resolved_at),
-          is_sports = EXCLUDED.is_sports, sport_name = EXCLUDED.sport_name, category_group = EXCLUDED.category_group, tags_json = EXCLUDED.tags_json
+          is_sports = EXCLUDED.is_sports, sport_name = EXCLUDED.sport_name, category_group = EXCLUDED.category_group, tags_json = EXCLUDED.tags_json,
+          volume = EXCLUDED.volume
         """;
     private static final String UPSERT_MARKET_TOKEN = """
         INSERT INTO polygon_market_tokens (token_id, condition_id, outcome)
@@ -69,12 +74,14 @@ public class PolymarketMarketsService extends AbstractVerticle {
     private static final int TOKEN_BATCH = 30;
 
     public static final String ADDRESS_TRIGGER_SYNC = "polymarket.markets.triggerSync";
+    public static final String ADDRESS_REFRESH_BY_SLUG = "polymarket.markets.refreshBySlug";
 
     private final Config cfg;
     private final WebClient webClient;
     private final PgPool pool;
     private final AtomicBoolean inFlight = new AtomicBoolean(false);
     private Long timerId;
+    private Long resolutionRefreshTimerId;
 
     public PolymarketMarketsService(Config cfg, WebClient webClient, PgPool pool) {
         this.cfg = cfg;
@@ -92,9 +99,22 @@ public class PolymarketMarketsService extends AbstractVerticle {
                 else msg.fail(500, ar.cause().getMessage());
             });
         });
+        vertx.eventBus().consumer(ADDRESS_REFRESH_BY_SLUG, msg -> {
+            String slug = msg.body() != null ? msg.body().toString() : null;
+            if (slug == null || slug.isBlank()) { msg.fail(400, "slug required"); return; }
+            refreshMarketBySlug(slug).onComplete(ar -> {
+                if (ar.succeeded()) msg.reply(ar.result());
+                else msg.fail(500, ar.cause().getMessage());
+            });
+        });
         runSync("initial").onComplete(ar -> {
             if (ar.failed()) log.warn("Initial markets sync failed: {}", ar.cause().getMessage());
             timerId = vertx.setPeriodic(cfg.polymarketMarketsIntervalMs, id -> run("periodic"));
+            if (cfg.rabbitHost != null && !cfg.rabbitHost.isEmpty()) {
+                resolutionRefreshTimerId = vertx.setPeriodic(cfg.polygonResolutionRefreshIntervalMs, id -> refreshResolutionForUnresolvedMarkets("resolution"));
+                log.info("Resolution refresh: every {}ms", cfg.polygonResolutionRefreshIntervalMs);
+                vertx.setTimer(1, id -> refreshResolutionForUnresolvedMarkets("initial"));
+            }
             p.complete();
         });
     }
@@ -102,6 +122,7 @@ public class PolymarketMarketsService extends AbstractVerticle {
     @Override
     public void stop(Promise<Void> p) {
         if (timerId != null) vertx.cancelTimer(timerId);
+        if (resolutionRefreshTimerId != null) vertx.cancelTimer(resolutionRefreshTimerId);
         p.complete();
     }
 
@@ -130,55 +151,115 @@ public class PolymarketMarketsService extends AbstractVerticle {
                         log.info("Polymarket markets {}: sync completed — {} token IDs, {} markets synced", trigger, tokenCount, marketsSynced);
                         return Future.succeededFuture();
                     });
-                })
-                .compose(v -> refreshResolutionForUnresolvedMarkets(trigger));
-    }
-
-    /** Re-fetch up to N markets with is_resolved=false by slug from Gamma and upsert to refresh is_resolved/resolved_at. */
-    private Future<Void> refreshResolutionForUnresolvedMarkets(String trigger) {
-        if (cfg.polymarketMarketsResolutionRefreshLimit <= 0) return Future.succeededFuture();
-        return getUnresolvedMarketSlugs(cfg.polymarketMarketsResolutionRefreshLimit)
-                .compose(slugs -> {
-                    if (slugs.isEmpty()) return Future.succeededFuture();
-                    log.info("Polymarket markets {}: refreshing resolution for {} markets (is_resolved=false)", trigger, slugs.size());
-                    return refreshResolutionBySlugs(slugs, 0, 0);
-                })
-                .compose(updated -> {
-                    if (updated > 0) log.info("Polymarket markets {}: resolution refresh updated {} markets", trigger, updated);
-                    return Future.succeededFuture();
                 });
     }
 
-    private Future<List<String>> getUnresolvedMarketSlugs(int limit) {
-        return pool.preparedQuery("SELECT slug FROM polygon_markets WHERE is_resolved = false AND slug IS NOT NULL AND slug != '' ORDER BY updated_at ASC LIMIT $1")
-                .execute(Tuple.of(limit))
+    /** Publish eligible (stuck) markets to Rabbit for resolution refresh. */
+    private Future<Void> refreshResolutionForUnresolvedMarkets(String trigger) {
+        if (cfg.rabbitHost == null || cfg.rabbitHost.isEmpty()) {
+            log.debug("Resolution refresh skipped: RABBIT_HOST not set");
+            return Future.succeededFuture();
+        }
+        if (cfg.rabbitPassword == null || cfg.rabbitPassword.isEmpty()) {
+            log.warn("Resolution refresh skipped: RABBIT_PASSWORD not set");
+            return Future.succeededFuture();
+        }
+        return getEligibleSlugsWithCooldown()
+                .compose(slugs -> publishSlugsToRabbit(trigger, slugs));
+    }
+
+    /** Eligibility: is_resolved=false, slug set, and (never in cooldown OR cooldown elapsed). No cap. */
+    private Future<List<String>> getEligibleSlugsWithCooldown() {
+        int cooldownHours = Math.max(0, cfg.polygonResolutionCheckCooldownHours);
+        return pool.preparedQuery("""
+            SELECT m.slug FROM polygon_markets m
+            LEFT JOIN polygon_resolution_check_cooldown c ON m.slug = c.slug
+            WHERE m.is_resolved = false AND m.slug IS NOT NULL AND m.slug != ''
+              AND (c.slug IS NULL OR c.last_check_at < NOW() - ($1 || ' hours')::interval)
+            ORDER BY m.updated_at ASC
+            """).execute(Tuple.of(String.valueOf(cooldownHours)))
                 .map(rs -> {
                     List<String> list = new ArrayList<>();
                     rs.forEach(row -> list.add(row.getString(0)));
                     return list;
                 })
-                .recover(e -> Future.succeededFuture(List.of()));
+                .recover(e -> {
+                    log.warn("Eligibility query failed (e.g. polygon_resolution_check_cooldown missing): {}", e.getMessage());
+                    return Future.succeededFuture(List.of());
+                });
     }
 
-    private Future<Integer> refreshResolutionBySlugs(List<String> slugs, int index, int updatedSoFar) {
-        if (index >= slugs.size()) return Future.succeededFuture(updatedSoFar);
-        String slug = slugs.get(index);
+    private Future<Void> publishSlugsToRabbit(String trigger, List<String> slugs) {
+        if (slugs.isEmpty()) {
+            log.debug("Resolution refresh {}: 0 eligible slugs (all resolved, or all in cooldown, or none with slug)", trigger);
+            return Future.succeededFuture();
+        }
+        ConnectionFactory factory = new ConnectionFactory();
+        factory.setHost(cfg.rabbitHost);
+        factory.setPort(cfg.rabbitPort);
+        factory.setUsername(cfg.rabbitUser);
+        factory.setPassword(cfg.rabbitPassword);
+        factory.setVirtualHost(cfg.rabbitVhost);
+        try { factory.useSslProtocol(); } catch (Exception e) { /* AWS MQ uses SSL */ }
+        Promise<Void> p = Promise.promise();
+        vertx.executeBlocking(block -> {
+            try (Connection conn = factory.newConnection();
+                 Channel ch = conn.createChannel()) {
+                ch.queueDeclare(cfg.rabbitQueueResolutionRefresh, true, false, false, null);
+                for (String slug : slugs) {
+                    ch.basicPublish("", cfg.rabbitQueueResolutionRefresh, null, slug.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                }
+                block.complete();
+            } catch (Exception e) {
+                block.fail(e);
+            }
+        }, false).onComplete(ar -> {
+            if (ar.failed()) {
+                log.warn("Polymarket markets {}: failed to publish {} slugs to Rabbit: {}", trigger, slugs.size(), ar.cause().getMessage());
+                p.fail(ar.cause());
+            } else {
+                upsertCooldown(slugs).onComplete(ca -> {
+                    if (ca.failed()) log.warn("Failed to upsert resolution cooldown: {}", ca.cause().getMessage());
+                    log.info("Polymarket markets {}: published {} slugs to Rabbit for resolution refresh", trigger, slugs.size());
+                    p.complete();
+                });
+            }
+        });
+        return p.future();
+    }
+
+    private Future<Void> upsertCooldown(List<String> slugs) {
+        if (slugs.isEmpty()) return Future.succeededFuture();
+        List<Tuple> rows = new ArrayList<>();
+        for (String slug : slugs) rows.add(Tuple.of(slug));
+        return pool.preparedQuery("""
+            INSERT INTO polygon_resolution_check_cooldown (slug, last_check_at, check_count)
+            VALUES ($1, CURRENT_TIMESTAMP, 1)
+            ON CONFLICT (slug) DO UPDATE SET last_check_at = CURRENT_TIMESTAMP, check_count = polygon_resolution_check_cooldown.check_count + 1
+            """)
+                .executeBatch(rows)
+                .map(rs -> (Void) null)
+                .recover(e -> Future.succeededFuture());
+    }
+
+    /** Fetch Gamma by slug and upsert only when umaResolutionStatus=resolved. Used by Rabbit consumer. */
+    public Future<Integer> refreshMarketBySlug(String slug) {
         String base = cfg.polymarketGammaApiUrl.replaceAll("/$", "");
         String path = base + "/markets/slug/" + java.net.URLEncoder.encode(slug, java.nio.charset.StandardCharsets.UTF_8).replace("+", "%20");
         return webClient.getAbs(path).timeout(15_000).send()
                 .compose(r -> {
-                    if (r.statusCode() != 200) return Future.succeededFuture(updatedSoFar);
+                    if (r.statusCode() != 200) return Future.succeededFuture(0);
                     try {
                         JsonObject m = r.bodyAsJsonObject();
-                        if (m == null) return Future.succeededFuture(updatedSoFar);
-                        return upsertMarketsAndTokens(new JsonArray().add(m))
-                                .map(n -> updatedSoFar + (n > 0 ? 1 : 0));
+                        if (m == null) return Future.succeededFuture(0);
+                        String uma = m.getString("umaResolutionStatus");
+                        if (!"resolved".equalsIgnoreCase(uma != null ? uma.trim() : "")) return Future.succeededFuture(0);
+                        return upsertMarketsAndTokens(new JsonArray().add(m));
                     } catch (Exception e) {
-                        return Future.succeededFuture(updatedSoFar);
+                        return Future.succeededFuture(0);
                     }
                 })
-                .recover(e -> Future.succeededFuture(updatedSoFar))
-                .compose(newUpdated -> refreshResolutionBySlugs(slugs, index + 1, newUpdated));
+                .recover(e -> Future.succeededFuture(0));
     }
 
     /** Token IDs from chain/trades that we haven't yet fetched market details for (resume-safe). */
@@ -200,22 +281,36 @@ public class PolymarketMarketsService extends AbstractVerticle {
                 .recover(e -> Future.succeededFuture(List.<String>of()));
     }
 
+    /** Page size for Gamma bootstrap (API often caps around 500). */
+    private static final int BOOTSTRAP_PAGE_SIZE = 500;
+
+    /** Bootstrap: fetch all active, non-closed markets via pagination (limit + offset). */
     private Future<List<String>> fetchBootstrapTokenIds() {
-        String path = cfg.polymarketGammaApiUrl.replaceAll("/$", "") + "/markets?limit=2000";
+        return fetchBootstrapTokenIdsPage(0, new ArrayList<>());
+    }
+
+    private Future<List<String>> fetchBootstrapTokenIdsPage(int offset, List<String> accumulatedIds) {
+        String base = cfg.polymarketGammaApiUrl.replaceAll("/$", "");
+        String path = base + "/markets?active=true&closed=false&limit=" + BOOTSTRAP_PAGE_SIZE + "&offset=" + offset;
         return webClient.getAbs(path).timeout(60_000).send()
                 .compose(r -> {
-                    if (r.statusCode() != 200) return Future.succeededFuture(List.<String>of());
+                    if (r.statusCode() != 200) return Future.succeededFuture(accumulatedIds);
                     JsonArray arr = parseBodyAsJsonArray(r);
-                    if (arr == null || arr.isEmpty()) return Future.succeededFuture(List.<String>of());
-                    List<String> ids = new ArrayList<>();
+                    if (arr == null || arr.isEmpty()) return Future.succeededFuture(accumulatedIds);
                     for (int i = 0; i < arr.size(); i++) {
                         JsonObject m = arr.getJsonObject(i);
                         JsonArray tokens = asJsonArray(m.getValue("clobTokenIds"));
-                        if (tokens != null) for (int j = 0; j < tokens.size(); j++) ids.add(tokens.getString(j));
+                        if (tokens != null) for (int j = 0; j < tokens.size(); j++) accumulatedIds.add(tokens.getString(j));
                     }
-                    return filterUnsynced(ids);
+                    int received = arr.size();
+                    log.debug("Bootstrap: page offset={}, received {} markets, total token IDs so far={}", offset, received, accumulatedIds.size());
+                    if (received < BOOTSTRAP_PAGE_SIZE)
+                        return filterUnsynced(accumulatedIds);
+                    Promise<List<String>> nextPromise = Promise.promise();
+                    vertx.setTimer(200, id -> fetchBootstrapTokenIdsPage(offset + received, accumulatedIds).onComplete(ar -> { if (ar.succeeded()) nextPromise.complete(ar.result()); else nextPromise.fail(ar.cause()); }));
+                    return nextPromise.future();
                 })
-                .recover(e -> Future.succeededFuture(List.<String>of()));
+                .recover(e -> Future.succeededFuture(accumulatedIds));
     }
 
     private static final int FILTER_BATCH = 200;
@@ -351,12 +446,11 @@ public class PolymarketMarketsService extends AbstractVerticle {
                         String slug = m.getString("slug");
                         String question = m.getString("question");
                         String tagsStr = tagsToCommaSeparated(asJsonArray(m.getValue("tags")));
-                        OffsetDateTime resolvedOn = parseResolved(m);
                         String closedTime = m.getString("closedTime");
-                        boolean closed = Boolean.TRUE.equals(m.getBoolean("closed"));
-                        boolean hasResolvedBy = firstNonBlank(m.getString("resolvedBy")) != null;
-                        boolean isResolved = closed || resolvedOn != null || hasResolvedBy;
-                        OffsetDateTime resolvedAt = resolvedOn;
+                        String umaResolutionStatus = m.getString("umaResolutionStatus");
+                        boolean isResolved = "resolved".equalsIgnoreCase(umaResolutionStatus != null ? umaResolutionStatus.trim() : "");
+                        OffsetDateTime closedTimeParsed = parseClosedTime(closedTime);
+                        OffsetDateTime resolvedAt = isResolved ? closedTimeParsed : null;
                         String categoryGroup = firstNonBlank(m.getString("categoryGroup"), m.getString("category"));
                         boolean isSports = (tagsStr != null && !tagsStr.isBlank())
                                 ? tagsStr.toLowerCase().contains("sports")
@@ -380,8 +474,9 @@ public class PolymarketMarketsService extends AbstractVerticle {
                                 }
                             }
                         }
-                        detailsRows.add(Tuple.of(conditionId, slug, question, tagsStr, resolvedOn, closedTime, isSports, sportName, leagueName, categoryGroup));
-                        polygonMarketsRows.add(Tuple.of(conditionId, slug, question, yesTokenId, noTokenId, isResolved, resolvedAt, isSports, sportName, categoryGroup, tagsStr));
+                        BigDecimal volume = parseVolume(m);
+                        detailsRows.add(Tuple.of(conditionId, slug, question, tagsStr, closedTimeParsed, closedTime, isSports, sportName, leagueName, categoryGroup));
+                        polygonMarketsRows.add(Tuple.of(conditionId, slug, question, yesTokenId, noTokenId, isResolved, resolvedAt, isSports, sportName, categoryGroup, tagsStr, volume));
                     }
                     final int count = detailsRows.size();
                     return pool.preparedQuery(UPSERT_MARKET).executeBatch(detailsRows)
@@ -455,8 +550,37 @@ public class PolymarketMarketsService extends AbstractVerticle {
         return null;
     }
 
-    /** Gamma: closedTime often "2020-11-02 16:31:01+00" (space, +00); resolvedAt rare. Normalize for parsing. */
+    /** Gamma: closedTime often "2020-11-02 16:31:01+00" (space, +00). Used as resolvedAt when resolved. */
     private static final DateTimeFormatter CLOSED_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ssXXX");
+
+    /** Gamma: volumeNum (number) or volume (string). */
+    private static BigDecimal parseVolume(JsonObject m) {
+        Object v = m.getValue("volumeNum");
+        if (v instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
+        if (v != null) {
+            try { return new BigDecimal(v.toString().trim()); } catch (Exception e) { }
+        }
+        String s = m.getString("volume");
+        if (s == null || s.isBlank()) return null;
+        try { return new BigDecimal(s.trim()); } catch (Exception e) { return null; }
+    }
+
+    private static OffsetDateTime parseClosedTime(String s) {
+        if (s == null || s.isBlank()) return null;
+        s = s.trim();
+        try { return OffsetDateTime.parse(s); } catch (DateTimeParseException e1) {
+            try { return Instant.parse(s).atOffset(ZoneOffset.UTC); } catch (Exception e2) {
+                try {
+                    String normalized = s.replace(" ", "T");
+                    if (s.endsWith("+00") && !s.endsWith("+00:00")) normalized = normalized.replace("+00", "+00:00");
+                    else if (s.endsWith("-00")) normalized = normalized.replace("-00", "-00:00");
+                    return OffsetDateTime.parse(normalized);
+                } catch (Exception e3) {
+                    try { return OffsetDateTime.parse(s, CLOSED_TIME_FORMAT); } catch (Exception e4) { return null; }
+                }
+            }
+        }
+    }
 
     /** From nested events[0] (e.g. "World Series Champion 2024") when sports. */
     private static String leagueFromMarket(JsonObject m, boolean isSports) {
